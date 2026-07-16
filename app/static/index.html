@@ -80,7 +80,11 @@
         <section id="view-files" class="view" aria-labelledby="files-heading">
           <div class="section-heading">
             <div><span class="section-label">仓库</span><h2 id="files-heading">文件管理</h2></div>
-            <button id="files-refresh" class="button secondary" type="button"><i data-lucide="refresh-cw"></i><span>刷新</span></button>
+            <div class="toolbar-actions">
+              <label class="compact-field" for="storage-model"><span>保存期限</span><select id="storage-model"><option value="99">永久</option><option value="0">24 小时</option><option value="1">3 天</option><option value="2">7 天</option></select></label>
+              <button id="upload-all" class="button primary" type="button" disabled><i data-lucide="upload"></i><span>开始上传</span></button>
+              <button id="files-refresh" class="button secondary" type="button"><i data-lucide="refresh-cw"></i><span>刷新</span></button>
+            </div>
           </div>
           <div id="upload-zone" class="upload-zone" tabindex="0">
             <input id="file-input" type="file" multiple hidden>
@@ -92,6 +96,7 @@
           <div class="table-wrap">
             <table><thead><tr><th>名称</th><th>大小</th><th>UKEY</th><th class="actions-column">操作</th></tr></thead><tbody id="files-body"></tbody></table>
             <div id="files-empty" class="empty-state">尚未加载文件</div>
+            <div class="pagination"><button id="files-prev" class="button secondary" type="button" disabled><i data-lucide="chevron-left"></i><span>上一页</span></button><span id="files-page">第 1 页</span><button id="files-next" class="button secondary" type="button"><span>下一页</span><i data-lucide="chevron-right"></i></button></div>
           </div>
         </section>
 
