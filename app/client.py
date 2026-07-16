@@ -74,12 +74,22 @@ class TmpLinkClient:
             download_limit=download_limit,
         )
 
+    async def create_download_link(self, ukey: str) -> ServiceResult:
+        return await self.create_link(ukey, valid_time=1440)
+
     async def delete_link(self, dkey: str, delete_file: bool = False) -> ServiceResult:
         return await self._direct(
             "link_del",
             dkey=dkey,
             delete="1" if delete_file else "0",
         )
+
+    async def delete_file(self, ukey: str) -> ServiceResult:
+        created = await self.create_link(ukey)
+        dkey = self._extract_dkey(created.data)
+        if not dkey:
+            raise TmpLinkBusinessError("钛盘未返回删除文件所需的 DKEY")
+        return await self.delete_link(dkey, delete_file=True)
 
     async def upload(
         self,
@@ -161,3 +171,14 @@ class TmpLinkClient:
             if value:
                 return str(value)
         return STATUS_MESSAGES.get(status, "")
+
+    @staticmethod
+    def _extract_dkey(data: Any) -> str:
+        if isinstance(data, str):
+            return data.strip()
+        if isinstance(data, dict):
+            for key in ("dkey", "direct_key"):
+                value = data.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+        return ""

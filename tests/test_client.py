@@ -140,6 +140,73 @@ async def test_permanent_upload_space_error_explains_the_next_action():
 
 
 @pytest.mark.asyncio
+async def test_download_link_is_valid_for_one_day_without_download_limit():
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(200, json={"status": 1, "data": {"dkey": "D1"}})
+
+    client = TmpLinkClient("test-key", transport=httpx.MockTransport(handler))
+
+    await client.create_download_link("FILE-UKEY")
+
+    assert form_data(captured[0]) == {
+        "action": "link_add",
+        "key": "test-key",
+        "ukey": "FILE-UKEY",
+        "valid_time": "1440",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "created_data",
+    ["D1", {"dkey": "D1"}, {"direct_key": "D1"}],
+)
+async def test_delete_file_creates_link_then_deletes_source(created_data):
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        if len(captured) == 1:
+            return httpx.Response(200, json={"status": 1, "data": created_data})
+        return httpx.Response(200, json={"status": 1, "data": True})
+
+    client = TmpLinkClient("test-key", transport=httpx.MockTransport(handler))
+
+    await client.delete_file("FILE-UKEY")
+
+    assert form_data(captured[0]) == {
+        "action": "link_add",
+        "key": "test-key",
+        "ukey": "FILE-UKEY",
+    }
+    assert form_data(captured[1]) == {
+        "action": "link_del",
+        "key": "test-key",
+        "dkey": "D1",
+        "delete": "1",
+    }
+
+
+@pytest.mark.asyncio
+async def test_delete_file_stops_when_link_response_has_no_dkey():
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(200, json={"status": 1, "data": {"link": "/d/example"}})
+
+    client = TmpLinkClient("test-key", transport=httpx.MockTransport(handler))
+
+    with pytest.raises(TmpLinkBusinessError, match="DKEY"):
+        await client.delete_file("FILE-UKEY")
+
+    assert len(captured) == 1
+
+
+@pytest.mark.asyncio
 async def test_business_error_is_descriptive_and_redacted():
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"status": 6, "message": "API Key invalid"})
