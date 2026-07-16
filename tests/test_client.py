@@ -113,6 +113,33 @@ async def test_upload_rejects_unknown_storage_model():
 
 
 @pytest.mark.asyncio
+async def test_empty_remote_lists_are_successful_empty_results():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"status": 0, "data": False, "debug": []})
+
+    client = TmpLinkClient("test-key", transport=httpx.MockTransport(handler))
+
+    files = await client.list_files()
+    links = await client.list_links()
+
+    assert files.ok is True
+    assert files.data == []
+    assert links.ok is True
+    assert links.data == []
+
+
+@pytest.mark.asyncio
+async def test_permanent_upload_space_error_explains_the_next_action():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"status": 4, "data": False})
+
+    client = TmpLinkClient("test-key", transport=httpx.MockTransport(handler))
+
+    with pytest.raises(TmpLinkBusinessError, match="私有空间不足.*临时保存期限"):
+        await client.upload("report.txt", b"hello", model=99)
+
+
+@pytest.mark.asyncio
 async def test_business_error_is_descriptive_and_redacted():
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"status": 6, "message": "API Key invalid"})

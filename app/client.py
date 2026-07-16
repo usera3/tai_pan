@@ -15,7 +15,7 @@ STATUS_MESSAGES = {
     "0": "Remote service rejected the request",
     "2": "File is too large",
     "3": "Remote service is busy",
-    "4": "Remote storage space is insufficient",
+    "4": "私有空间不足，请改用 24 小时、3 天或 7 天的临时保存期限",
     "5": "Account quota is insufficient",
     "6": "API Key is invalid",
     "1001": "File does not exist",
@@ -56,10 +56,10 @@ class TmpLinkClient:
         return await self._direct("quota")
 
     async def list_files(self, page: int = 1) -> ServiceResult:
-        return await self._direct("list_of_workspace", page=page)
+        return await self._direct("list_of_workspace", empty_is_success=True, page=page)
 
     async def list_links(self, page: int = 1) -> ServiceResult:
-        return await self._direct("list_of_direct", page=page)
+        return await self._direct("list_of_direct", empty_is_success=True, page=page)
 
     async def create_link(
         self,
@@ -95,7 +95,13 @@ class TmpLinkClient:
             files={"file": (file_name, content, "application/octet-stream")},
         )
 
-    async def _direct(self, action: str, **fields: Any) -> ServiceResult:
+    async def _direct(
+        self,
+        action: str,
+        *,
+        empty_is_success: bool = False,
+        **fields: Any,
+    ) -> ServiceResult:
         form = {"action": action, "key": self.api_key}
         form.update(
             {
@@ -104,13 +110,18 @@ class TmpLinkClient:
                 if value is not None and value != ""
             }
         )
-        return await self._request(DIRECT_URL, data=form)
+        return await self._request(
+            DIRECT_URL,
+            data=form,
+            empty_is_success=empty_is_success,
+        )
 
     async def _request(
         self,
         url: str,
         data: dict[str, str],
         files: dict[str, tuple[str, bytes, str]] | None = None,
+        empty_is_success: bool = False,
     ) -> ServiceResult:
         try:
             async with httpx.AsyncClient(
@@ -136,6 +147,8 @@ class TmpLinkClient:
             raise TmpLinkBusinessError("Remote service returned an invalid response")
 
         status = str(payload.get("status", "0"))
+        if status == "0" and empty_is_success:
+            return ServiceResult(ok=True, data=[], message="")
         message = self._message(payload, status)
         if status != "1":
             raise TmpLinkBusinessError(message)

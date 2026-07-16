@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from fastapi import FastAPI, File, Form, Query, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -145,6 +145,10 @@ def create_app(
     @application.get("/", include_in_schema=False)
     async def index():
         return FileResponse(static_dir / "index.html")
+
+    @application.get("/favicon.ico", include_in_schema=False)
+    async def favicon():
+        return Response(status_code=204)
 
     application.mount("/static", StaticFiles(directory=static_dir), name="static")
 

@@ -40,3 +40,13 @@ def test_static_assets_are_served(tmp_path: Path):
     assert client.get("/static/app.css").status_code == 200
     assert client.get("/static/app.js").status_code == 200
     assert client.get("/static/vendor/lucide.min.js").status_code == 200
+    assert client.get("/favicon.ico").status_code == 204
+
+
+def test_three_day_storage_is_the_default_and_permanent_is_explicit(tmp_path: Path):
+    client = TestClient(create_app(settings_path=tmp_path / "settings.json"))
+
+    html = client.get("/").text
+
+    assert '<option value="1" selected>3 天</option>' in html
+    assert '<option value="99">永久（需私有空间）</option>' in html
