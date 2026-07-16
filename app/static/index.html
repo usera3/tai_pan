@@ -157,6 +157,14 @@
       <div class="dialog-actions"><button class="button secondary" type="button" data-close-dialog="delete-dialog">取消</button><button id="delete-link-submit" class="button danger" type="submit">确认删除</button></div>
     </form>
   </dialog>
+  <dialog id="file-delete-dialog" class="dialog">
+    <form id="file-delete-form" class="dialog-form">
+      <div class="dialog-heading"><div><span class="section-label">不可撤销</span><h2>删除源文件</h2></div><button class="icon-button" type="button" data-close-dialog="file-delete-dialog" aria-label="关闭"><i data-lucide="x"></i></button></div>
+      <p class="dialog-copy danger-copy">将永久删除 <strong id="file-delete-name">-</strong>，全部相关直链也会立即失效。</p>
+      <div id="file-delete-message" class="form-message" role="status"></div>
+      <div class="dialog-actions"><button class="button secondary" type="button" data-close-dialog="file-delete-dialog">取消</button><button id="delete-file-submit" class="button danger" type="submit">删除文件</button></div>
+    </form>
+  </dialog>
   <div id="toast-region" class="toast-region" aria-live="polite"></div>
   <script src="/static/vendor/lucide.min.js"></script>
   <script src="/static/app.js"></script>

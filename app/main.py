@@ -110,6 +110,17 @@ def create_app(
     async def files(page: int = Query(default=1, ge=1)):
         return result_envelope(await remote_client().list_files(page))
 
+    @application.post("/api/files/{ukey}/download")
+    async def download_file(ukey: str):
+        return result_envelope(await remote_client().create_download_link(ukey))
+
+    @application.delete("/api/files/{ukey}")
+    async def delete_file(ukey: str):
+        return result_envelope(
+            await remote_client().delete_file(ukey),
+            "File deleted",
+        )
+
     @application.get("/api/links")
     async def links(page: int = Query(default=1, ge=1)):
         return result_envelope(await remote_client().list_links(page))

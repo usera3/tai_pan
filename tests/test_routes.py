@@ -42,6 +42,14 @@ class FakeTmpLinkClient:
         self.calls.append(("delete_link", dkey, delete_file))
         return self._result({"deleted": True})
 
+    async def create_download_link(self, ukey):
+        self.calls.append(("create_download_link", ukey))
+        return self._result({"dkey": "D1", "link": "/download/D1"})
+
+    async def delete_file(self, ukey):
+        self.calls.append(("delete_file", ukey))
+        return self._result({"deleted": True})
+
     async def upload(self, file_name, content, model):
         self.calls.append(("upload", file_name, content, model))
         return self._result("UPLOADED-UKEY")
@@ -128,6 +136,27 @@ def test_proxy_routes_call_expected_remote_methods(client, fake_remote):
         ("create_link", "U1", 60, 3),
         ("delete_link", "D1", True),
         ("upload", "report.txt", b"hello", 99),
+    ]
+
+
+def test_file_download_and_delete_routes_call_expected_methods(client, fake_remote):
+    configure(client)
+
+    download = client.post("/api/files/FILE%20UKEY/download")
+    deleted = client.delete("/api/files/FILE%20UKEY")
+
+    assert download.status_code == 200
+    assert download.json() == {
+        "ok": True,
+        "data": {"dkey": "D1", "link": "/download/D1"},
+        "message": "",
+    }
+    assert deleted.status_code == 200
+    assert deleted.json()["data"] == {"deleted": True}
+    assert deleted.json()["message"] == "File deleted"
+    assert fake_remote.calls == [
+        ("create_download_link", "FILE UKEY"),
+        ("delete_file", "FILE UKEY"),
     ]
 
 

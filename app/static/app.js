@@ -12,6 +12,7 @@ const state = {
   uploading: false,
   pendingLinkUkey: "",
   pendingDeleteDkey: "",
+  pendingFile: null,
 };
 
 const STORAGE_MODES = new Set([99, 0, 1, 2]);
@@ -268,7 +269,9 @@ function renderFiles() {
     if (file.ukey) {
       actionsCell.append(
         iconButton("copy", "复制 UKEY", () => copyText(file.ukey)),
+        iconButton("download", "下载文件", () => downloadFile(file)),
         iconButton("link-2", "创建直链", () => openLinkDialog(file.ukey)),
+        iconButton("trash-2", "删除文件", () => openFileDeleteDialog(file), true),
       );
     }
     row.append(actionsCell);
@@ -278,6 +281,55 @@ function renderFiles() {
   byId("files-page").textContent = `第 ${state.filesPage} 页`;
   byId("files-prev").disabled = state.filesPage <= 1;
   initIcons();
+}
+
+async function downloadFile(file) {
+  const popup = window.open("about:blank", "_blank");
+  try {
+    const result = await api(`/api/files/${encodeURIComponent(file.ukey)}/download`, { method: "POST" });
+    const link = typeof result === "string" ? result : result && (result.link || result.url);
+    const url = linkUrl(link);
+    if (!url) throw new Error("钛盘未返回下载链接");
+    if (popup) popup.location.replace(url);
+    else window.location.assign(url);
+  } catch (error) {
+    if (popup) popup.close();
+    toast(error.message);
+  }
+}
+
+function openFileDeleteDialog(file) {
+  state.pendingFile = file;
+  setText("file-delete-name", file.name || file.ukey);
+  const message = byId("file-delete-message");
+  message.textContent = "";
+  message.className = "form-message";
+  byId("file-delete-dialog").showModal();
+  initIcons();
+}
+
+async function submitFileDelete(event) {
+  event.preventDefault();
+  if (!state.pendingFile) return;
+  const button = byId("delete-file-submit");
+  const message = byId("file-delete-message");
+  button.disabled = true;
+  message.textContent = "正在删除";
+  message.className = "form-message";
+  try {
+    await api(`/api/files/${encodeURIComponent(state.pendingFile.ukey)}`, { method: "DELETE" });
+    byId("file-delete-dialog").close();
+    state.pendingFile = null;
+    toast("文件已删除");
+    await loadFiles();
+    await loadLinks();
+    await refreshDashboard();
+  } catch (error) {
+    message.textContent = error.message;
+    message.className = "form-message error";
+  } finally {
+    button.disabled = false;
+  }
 }
 
 function openLinkDialog(ukey = "") {
@@ -527,6 +579,7 @@ function bindEvents() {
   byId("links-next").addEventListener("click", async () => { state.linksPage += 1; await loadLinks(); });
   byId("link-form").addEventListener("submit", submitLink);
   byId("delete-form").addEventListener("submit", submitDelete);
+  byId("file-delete-form").addEventListener("submit", submitFileDelete);
   document.querySelectorAll("[data-close-dialog]").forEach((button) => button.addEventListener("click", () => byId(button.dataset.closeDialog).close()));
   const zone = byId("upload-zone");
   ["dragenter", "dragover"].forEach((name) => zone.addEventListener(name, (event) => { event.preventDefault(); zone.classList.add("is-dragging"); }));

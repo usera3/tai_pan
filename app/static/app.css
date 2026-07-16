@@ -123,6 +123,7 @@ th { color: var(--muted); background: var(--surface-muted); font-size: 11px; tex
 .two-column-fields { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 8px; }
 .dialog-copy { margin: 2px 0 6px; color: var(--muted); font-size: 13px; }
+.danger-copy strong { color: var(--red); overflow-wrap: anywhere; }
 .checkbox-row { min-height: 40px; padding: 0 10px; border: 1px solid var(--line); border-radius: 5px; display: flex !important; align-items: center; gap: 9px; font-weight: 500 !important; }
 
 @media (max-width: 900px) {
@@ -148,6 +149,14 @@ th { color: var(--muted); background: var(--surface-muted); font-size: 11px; tex
   .toolbar-actions { justify-content: flex-start; }
   .queue-item { grid-template-columns: minmax(0, 1fr) auto; }
   .queue-status { grid-column: 1 / -1; }
+  .table-wrap th:last-child, .table-wrap td:last-child { position: sticky; right: 0; z-index: 1; background: var(--surface); box-shadow: -8px 0 12px rgba(26, 38, 49, 0.06); }
+  .table-wrap th:last-child { z-index: 2; background: var(--surface-muted); }
+  .table-wrap td.row-actions { min-width: 140px; }
+  #view-files table { min-width: 100%; table-layout: fixed; }
+  #view-files th:nth-child(2), #view-files td:nth-child(2), #view-files th:nth-child(3), #view-files td:nth-child(3) { display: none; }
+  #view-files th:first-child, #view-files td:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #view-files .actions-column, #view-files td.row-actions { width: 168px; min-width: 168px; }
+  #view-files .pagination { min-width: 0; }
   .settings-form { padding: 14px; }
   .two-column-fields { grid-template-columns: 1fr; gap: 4px; }
 }
