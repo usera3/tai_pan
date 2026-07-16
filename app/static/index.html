@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>本地直链管理器</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <div id="app" class="app-shell">
+    <aside class="sidebar" aria-label="主导航">
+      <div class="brand">
+        <span class="brand-mark"><i data-lucide="hard-drive-upload"></i></span>
+        <span class="brand-copy"><strong>直链管理器</strong><small>本地服务</small></span>
+      </div>
+      <nav class="nav-list">
+        <button class="nav-item is-active" type="button" data-view="dashboard">
+          <i data-lucide="layout-dashboard"></i><span>概览</span>
+        </button>
+        <button class="nav-item" type="button" data-view="files">
+          <i data-lucide="files"></i><span>文件</span>
+        </button>
+        <button class="nav-item" type="button" data-view="links">
+          <i data-lucide="link-2"></i><span>直链</span>
+        </button>
+        <button class="nav-item" type="button" data-view="settings">
+          <i data-lucide="settings-2"></i><span>设置</span>
+        </button>
+      </nav>
+      <div class="sidebar-status">
+        <span id="sidebar-status-dot" class="status-dot"></span>
+        <span id="sidebar-status-text">未检查连接</span>
+      </div>
+    </aside>
+
+    <section class="workspace">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">TMP.LINK</p>
+          <h1 id="page-title">概览</h1>
+        </div>
+        <button id="refresh-button" class="icon-button" type="button" title="刷新当前页面" aria-label="刷新当前页面">
+          <i data-lucide="refresh-cw"></i>
+        </button>
+      </header>
+
+      <main class="content">
+        <section id="view-dashboard" class="view is-active" aria-labelledby="page-title">
+          <div class="status-strip">
+            <div>
+              <span class="section-label">服务状态</span>
+              <strong id="connection-label">等待连接</strong>
+            </div>
+            <button class="button secondary" type="button" data-action="open-settings">
+              <i data-lucide="key-round"></i><span>配置连接</span>
+            </button>
+          </div>
+          <div class="stat-grid">
+            <article class="stat-card">
+              <span>可用配额</span><strong id="quota-value">-</strong><small>字节</small>
+            </article>
+            <article class="stat-card">
+              <span>当前页文件</span><strong id="file-count">-</strong><small>项</small>
+            </article>
+            <article class="stat-card">
+              <span>当前页直链</span><strong id="link-count">-</strong><small>项</small>
+            </article>
+            <article class="stat-card accent-card">
+              <span>自定义域名</span><strong id="domain-value">pan.cloudcode.xyz</strong><small>HTTPS</small>
+            </article>
+          </div>
+          <div class="section-band">
+            <div class="section-heading">
+              <div><span class="section-label">最近状态</span><h2>操作记录</h2></div>
+            </div>
+            <div id="activity-list" class="empty-state">暂无本地操作记录</div>
+          </div>
+        </section>
+
+        <section id="view-files" class="view" aria-labelledby="files-heading">
+          <div class="section-heading">
+            <div><span class="section-label">仓库</span><h2 id="files-heading">文件管理</h2></div>
+            <button id="files-refresh" class="button secondary" type="button"><i data-lucide="refresh-cw"></i><span>刷新</span></button>
+          </div>
+          <div id="upload-zone" class="upload-zone" tabindex="0">
+            <input id="file-input" type="file" multiple hidden>
+            <i data-lucide="cloud-upload"></i>
+            <strong>选择或拖入文件</strong>
+            <button id="choose-files" class="button primary" type="button">选择文件</button>
+          </div>
+          <div id="upload-queue" class="upload-queue" aria-live="polite"></div>
+          <div class="table-wrap">
+            <table><thead><tr><th>名称</th><th>大小</th><th>UKEY</th><th class="actions-column">操作</th></tr></thead><tbody id="files-body"></tbody></table>
+            <div id="files-empty" class="empty-state">尚未加载文件</div>
+          </div>
+        </section>
+
+        <section id="view-links" class="view" aria-labelledby="links-heading">
+          <div class="section-heading">
+            <div><span class="section-label">分发</span><h2 id="links-heading">直链管理</h2></div>
+            <button id="new-link" class="button primary" type="button"><i data-lucide="plus"></i><span>创建直链</span></button>
+          </div>
+          <div class="table-wrap">
+            <table><thead><tr><th>名称</th><th>链接</th><th>到期时间</th><th class="actions-column">操作</th></tr></thead><tbody id="links-body"></tbody></table>
+            <div id="links-empty" class="empty-state">尚未加载直链</div>
+          </div>
+        </section>
+
+        <section id="view-settings" class="view" aria-labelledby="settings-heading">
+          <div class="section-heading">
+            <div><span class="section-label">本地配置</span><h2 id="settings-heading">连接设置</h2></div>
+            <span id="key-badge" class="badge neutral">未配置</span>
+          </div>
+          <form id="settings-form" class="settings-form">
+            <label for="api-key">API Key</label>
+            <div class="input-with-icon"><i data-lucide="key-round"></i><input id="api-key" name="api_key" type="password" autocomplete="off" placeholder="输入新 Key，留空则保留现有值"></div>
+            <label for="custom-domain">自定义域名</label>
+            <div class="input-with-icon"><i data-lucide="globe-2"></i><input id="custom-domain" name="custom_domain" type="text" value="pan.cloudcode.xyz"></div>
+            <div id="settings-message" class="form-message" role="status"></div>
+            <div class="form-actions">
+              <button id="save-settings" class="button primary" type="submit"><i data-lucide="save"></i><span>保存设置</span></button>
+              <button id="test-connection" class="button secondary" type="button"><i data-lucide="plug-zap"></i><span>测试连接</span></button>
+              <button id="clear-key" class="button danger-text" type="button"><i data-lucide="trash-2"></i><span>清除 Key</span></button>
+            </div>
+          </form>
+        </section>
+      </main>
+    </section>
+  </div>
+  <div id="toast-region" class="toast-region" aria-live="polite"></div>
+  <script src="/static/vendor/lucide.min.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>

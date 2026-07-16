@@ -4,7 +4,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 from fastapi import FastAPI, File, Form, Query, Request, UploadFile
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from app.client import (
@@ -138,6 +139,14 @@ def create_app(
             raise LocalApiError(422, "Uploaded file must not be empty")
         result = await remote_client().upload(file.filename or "upload.bin", content, model)
         return result_envelope(result, "File uploaded")
+
+    static_dir = Path(__file__).parent / "static"
+
+    @application.get("/", include_in_schema=False)
+    async def index():
+        return FileResponse(static_dir / "index.html")
+
+    application.mount("/static", StaticFiles(directory=static_dir), name="static")
 
     return application
 
