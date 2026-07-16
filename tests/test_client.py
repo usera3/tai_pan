@@ -145,11 +145,14 @@ async def test_download_link_is_valid_for_one_day_without_download_limit():
 
     def handler(request: httpx.Request) -> httpx.Response:
         captured.append(request)
-        return httpx.Response(200, json={"status": 1, "data": {"dkey": "D1"}})
+        return httpx.Response(
+            200,
+            json={"status": 1, "data": [{"dkey": "D1", "link": "/d/D1"}]},
+        )
 
     client = TmpLinkClient("test-key", transport=httpx.MockTransport(handler))
 
-    await client.create_download_link("FILE-UKEY")
+    result = await client.create_download_link("FILE-UKEY")
 
     assert form_data(captured[0]) == {
         "action": "link_add",
@@ -157,12 +160,13 @@ async def test_download_link_is_valid_for_one_day_without_download_limit():
         "ukey": "FILE-UKEY",
         "valid_time": "1440",
     }
+    assert result.data == {"dkey": "D1", "link": "/d/D1"}
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "created_data",
-    ["D1", {"dkey": "D1"}, {"direct_key": "D1"}],
+    ["D1", {"dkey": "D1"}, {"direct_key": "D1"}, [{"dkey": "D1"}]],
 )
 async def test_delete_file_creates_link_then_deletes_source(created_data):
     captured: list[httpx.Request] = []

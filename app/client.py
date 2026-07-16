@@ -75,7 +75,9 @@ class TmpLinkClient:
         )
 
     async def create_download_link(self, ukey: str) -> ServiceResult:
-        return await self.create_link(ukey, valid_time=1440)
+        result = await self.create_link(ukey, valid_time=1440)
+        data = result.data[0] if isinstance(result.data, list) and result.data else result.data
+        return ServiceResult(ok=result.ok, data=data, message=result.message)
 
     async def delete_link(self, dkey: str, delete_file: bool = False) -> ServiceResult:
         return await self._direct(
@@ -176,6 +178,11 @@ class TmpLinkClient:
     def _extract_dkey(data: Any) -> str:
         if isinstance(data, str):
             return data.strip()
+        if isinstance(data, list):
+            for item in data:
+                dkey = TmpLinkClient._extract_dkey(item)
+                if dkey:
+                    return dkey
         if isinstance(data, dict):
             for key in ("dkey", "direct_key"):
                 value = data.get(key)
