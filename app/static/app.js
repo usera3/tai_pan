@@ -7,8 +7,11 @@ const state = {
   uploadQueue: [],
   files: [],
   filesPage: 1,
+  links: [],
+  linksPage: 1,
   uploading: false,
   pendingLinkUkey: "",
+  pendingDeleteDkey: "",
 };
 
 const STORAGE_MODES = new Set([99, 0, 1, 2]);
@@ -280,7 +283,117 @@ function renderFiles() {
 function openLinkDialog(ukey = "") {
   state.pendingLinkUkey = ukey;
   navigate("links");
-  toast(ukey ? "已选择文件，填写直链参数" : "填写直链参数");
+  byId("link-ukey").value = ukey;
+  byId("link-message").textContent = "";
+  byId("link-dialog").showModal();
+  initIcons();
+}
+
+function linkUrl(value) {
+  if (!value) return "";
+  if (/^https?:\/\//i.test(value)) return value;
+  return `https://${state.settings.custom_domain}/${String(value).replace(/^\/+/, "")}`;
+}
+
+async function loadLinks() {
+  try {
+    const data = await api(`/api/links?page=${state.linksPage}`);
+    state.links = normalizeRows(data);
+    renderLinks();
+  } catch (error) {
+    toast(error.message);
+  }
+}
+
+function renderLinks() {
+  const body = byId("links-body");
+  body.replaceChildren();
+  state.links.forEach((link) => {
+    const url = linkUrl(link.link);
+    const row = document.createElement("tr");
+    row.append(
+      createElement("td", "", link.name || "-"),
+      createElement("td", "link-cell", url || "-"),
+      createElement("td", "", link.etime || "-"),
+    );
+    const actionsCell = createElement("td", "row-actions");
+    if (url) {
+      actionsCell.append(
+        iconButton("copy", "复制链接", () => copyText(url)),
+        iconButton("external-link", "打开链接", () => window.open(url, "_blank", "noopener")),
+      );
+    }
+    if (link.dkey) actionsCell.append(iconButton("trash-2", "删除直链", () => openDeleteDialog(link.dkey), true));
+    row.append(actionsCell);
+    body.append(row);
+  });
+  byId("links-empty").style.display = state.links.length ? "none" : "grid";
+  byId("links-page").textContent = `第 ${state.linksPage} 页`;
+  byId("links-prev").disabled = state.linksPage <= 1;
+  initIcons();
+}
+
+async function submitLink(event) {
+  event.preventDefault();
+  const button = byId("create-link-submit");
+  const message = byId("link-message");
+  button.disabled = true;
+  message.textContent = "正在创建";
+  message.className = "form-message";
+  const validTime = byId("link-valid-time").value;
+  const downloadLimit = byId("link-download-limit").value;
+  try {
+    const result = await api("/api/links", {
+      method: "POST",
+      body: {
+        ukey: byId("link-ukey").value,
+        valid_time: validTime ? Number(validTime) : null,
+        download_limit: downloadLimit ? Number(downloadLimit) : null,
+      },
+    });
+    byId("link-dialog").close();
+    toast("直链已创建");
+    state.linksPage = 1;
+    await loadLinks();
+    await refreshDashboard();
+    const url = result && linkUrl(result.link);
+    if (url) await copyText(url);
+  } catch (error) {
+    message.textContent = error.message;
+    message.className = "form-message error";
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function openDeleteDialog(dkey) {
+  state.pendingDeleteDkey = dkey;
+  byId("delete-file").checked = false;
+  byId("delete-message").textContent = "";
+  byId("delete-dialog").showModal();
+  initIcons();
+}
+
+async function submitDelete(event) {
+  event.preventDefault();
+  const button = byId("delete-link-submit");
+  const message = byId("delete-message");
+  button.disabled = true;
+  message.textContent = "正在删除";
+  try {
+    const deleteFile = byId("delete-file").checked;
+    await api(`/api/links/${encodeURIComponent(state.pendingDeleteDkey)}?delete_file=${deleteFile}`, { method: "DELETE" });
+    byId("delete-dialog").close();
+    toast("直链已删除");
+    await loadLinks();
+    await loadFiles();
+    await refreshDashboard();
+  } catch (error) {
+    message.textContent = error.message;
+    message.className = "form-message error";
+  } finally {
+    button.disabled = false;
+  }
 }
 
 function updateSettingsUi(settings) {
@@ -319,7 +432,8 @@ async function refreshDashboard() {
   ]);
   if (results[0].status === "fulfilled") {
     const quota = results[0].value;
-    setText("quota-value", quota && typeof quota === "object" ? (quota.quota ?? quota.data ?? "-") : quota);
+    const quotaValue = quota && typeof quota === "object" ? (quota.quota ?? quota.data) : quota;
+    setText("quota-value", quotaValue == null ? "-" : formatBytes(quotaValue));
   }
   if (results[1].status === "fulfilled") setText("file-count", arrayFromData(results[1].value).length);
   if (results[2].status === "fulfilled") setText("link-count", arrayFromData(results[2].value).length);
@@ -389,7 +503,10 @@ async function clearKey() {
 
 function bindEvents() {
   document.querySelectorAll(".nav-item").forEach((button) => {
-    button.addEventListener("click", () => navigate(button.dataset.view));
+    button.addEventListener("click", async () => {
+      navigate(button.dataset.view);
+      await refreshCurrentView();
+    });
   });
   document.querySelectorAll('[data-action="open-settings"]').forEach((button) => {
     button.addEventListener("click", () => navigate("settings"));
@@ -404,17 +521,28 @@ function bindEvents() {
   byId("files-refresh").addEventListener("click", loadFiles);
   byId("files-prev").addEventListener("click", async () => { if (state.filesPage > 1) { state.filesPage -= 1; await loadFiles(); } });
   byId("files-next").addEventListener("click", async () => { state.filesPage += 1; await loadFiles(); });
+  byId("new-link").addEventListener("click", () => openLinkDialog());
+  byId("links-refresh").addEventListener("click", loadLinks);
+  byId("links-prev").addEventListener("click", async () => { if (state.linksPage > 1) { state.linksPage -= 1; await loadLinks(); } });
+  byId("links-next").addEventListener("click", async () => { state.linksPage += 1; await loadLinks(); });
+  byId("link-form").addEventListener("submit", submitLink);
+  byId("delete-form").addEventListener("submit", submitDelete);
+  document.querySelectorAll("[data-close-dialog]").forEach((button) => button.addEventListener("click", () => byId(button.dataset.closeDialog).close()));
   const zone = byId("upload-zone");
   ["dragenter", "dragover"].forEach((name) => zone.addEventListener(name, (event) => { event.preventDefault(); zone.classList.add("is-dragging"); }));
   ["dragleave", "drop"].forEach((name) => zone.addEventListener(name, (event) => { event.preventDefault(); zone.classList.remove("is-dragging"); }));
   zone.addEventListener("drop", (event) => addFiles(event.dataTransfer.files));
   zone.addEventListener("keydown", (event) => { if (event.key === "Enter" || event.key === " ") byId("file-input").click(); });
-  window.addEventListener("hashchange", () => navigate(location.hash.slice(1)));
+  window.addEventListener("hashchange", async () => {
+    navigate(location.hash.slice(1));
+    await refreshCurrentView();
+  });
 }
 
 async function refreshCurrentView() {
   if (state.activeView === "dashboard") await refreshDashboard();
   if (state.activeView === "files") await loadFiles();
+  if (state.activeView === "links") await loadLinks();
   if (state.activeView === "settings") await loadSettings();
 }
 
@@ -423,7 +551,7 @@ async function boot() {
   navigate(location.hash.slice(1) || "dashboard");
   try {
     await loadSettings();
-    await refreshDashboard();
+    await refreshCurrentView();
   } catch (error) {
     setConnection("error", "本地服务异常");
     toast(error.message);

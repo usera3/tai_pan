@@ -40,3 +40,23 @@ def test_frontend_never_persists_api_key():
         "URLSearchParams",
     ):
         assert forbidden not in source
+
+
+def test_direct_link_contract_includes_create_copy_and_delete():
+    source = frontend_source()
+    html = Path("app/static/index.html").read_text(encoding="utf-8")
+
+    assert 'api(`/api/links?page=${state.linksPage}`)' in source
+    assert 'api("/api/links", {' in source
+    assert "delete_file" in source
+    assert "copyText" in source
+    for element_id in (
+        "link-dialog",
+        "link-form",
+        "link-ukey",
+        "link-valid-time",
+        "link-download-limit",
+        "delete-dialog",
+        "delete-file",
+    ):
+        assert f'id="{element_id}"' in html

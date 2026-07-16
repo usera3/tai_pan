@@ -57,7 +57,7 @@
           </div>
           <div class="stat-grid">
             <article class="stat-card">
-              <span>可用配额</span><strong id="quota-value">-</strong><small>字节</small>
+              <span>可用配额</span><strong id="quota-value">-</strong><small>可用空间</small>
             </article>
             <article class="stat-card">
               <span>当前页文件</span><strong id="file-count">-</strong><small>项</small>
@@ -103,11 +103,15 @@
         <section id="view-links" class="view" aria-labelledby="links-heading">
           <div class="section-heading">
             <div><span class="section-label">分发</span><h2 id="links-heading">直链管理</h2></div>
-            <button id="new-link" class="button primary" type="button"><i data-lucide="plus"></i><span>创建直链</span></button>
+            <div class="toolbar-actions">
+              <button id="links-refresh" class="button secondary" type="button"><i data-lucide="refresh-cw"></i><span>刷新</span></button>
+              <button id="new-link" class="button primary" type="button"><i data-lucide="plus"></i><span>创建直链</span></button>
+            </div>
           </div>
           <div class="table-wrap">
             <table><thead><tr><th>名称</th><th>链接</th><th>到期时间</th><th class="actions-column">操作</th></tr></thead><tbody id="links-body"></tbody></table>
             <div id="links-empty" class="empty-state">尚未加载直链</div>
+            <div class="pagination"><button id="links-prev" class="button secondary" type="button" disabled><i data-lucide="chevron-left"></i><span>上一页</span></button><span id="links-page">第 1 页</span><button id="links-next" class="button secondary" type="button"><span>下一页</span><i data-lucide="chevron-right"></i></button></div>
           </div>
         </section>
 
@@ -132,6 +136,27 @@
       </main>
     </section>
   </div>
+  <dialog id="link-dialog" class="dialog">
+    <form id="link-form" class="dialog-form">
+      <div class="dialog-heading"><div><span class="section-label">分发设置</span><h2>创建直链</h2></div><button class="icon-button" type="button" data-close-dialog="link-dialog" aria-label="关闭"><i data-lucide="x"></i></button></div>
+      <label for="link-ukey">文件 UKEY</label><input id="link-ukey" name="ukey" required autocomplete="off">
+      <div class="two-column-fields">
+        <div><label for="link-valid-time">有效时间（分钟）</label><input id="link-valid-time" name="valid_time" type="number" min="1" placeholder="留空为默认"></div>
+        <div><label for="link-download-limit">下载次数</label><input id="link-download-limit" name="download_limit" type="number" min="1" placeholder="留空为默认"></div>
+      </div>
+      <div id="link-message" class="form-message" role="status"></div>
+      <div class="dialog-actions"><button class="button secondary" type="button" data-close-dialog="link-dialog">取消</button><button id="create-link-submit" class="button primary" type="submit">创建直链</button></div>
+    </form>
+  </dialog>
+  <dialog id="delete-dialog" class="dialog">
+    <form id="delete-form" class="dialog-form">
+      <div class="dialog-heading"><div><span class="section-label">危险操作</span><h2>删除直链</h2></div><button class="icon-button" type="button" data-close-dialog="delete-dialog" aria-label="关闭"><i data-lucide="x"></i></button></div>
+      <p class="dialog-copy">删除后该直链将无法继续访问。</p>
+      <label class="checkbox-row" for="delete-file"><input id="delete-file" type="checkbox"><span>同时删除源文件</span></label>
+      <div id="delete-message" class="form-message" role="status"></div>
+      <div class="dialog-actions"><button class="button secondary" type="button" data-close-dialog="delete-dialog">取消</button><button id="delete-link-submit" class="button danger" type="submit">确认删除</button></div>
+    </form>
+  </dialog>
   <div id="toast-region" class="toast-region" aria-live="polite"></div>
   <script src="/static/vendor/lucide.min.js"></script>
   <script src="/static/app.js"></script>

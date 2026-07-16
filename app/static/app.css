@@ -69,6 +69,7 @@ svg { width: 18px; height: 18px; stroke-width: 1.8; }
 .button { min-height: 36px; border-radius: 5px; border: 1px solid transparent; padding: 0 14px; display: inline-flex; align-items: center; justify-content: center; gap: 8px; font-weight: 650; }
 .button.primary { color: #fff; background: var(--blue); }
 .button.secondary { color: var(--text); background: var(--surface); border-color: var(--line-strong); }
+.button.danger { color: #fff; background: var(--red); }
 .button.danger-text { color: var(--red); background: transparent; border-color: transparent; }
 .button:hover { filter: brightness(0.97); }
 .badge { min-height: 26px; padding: 0 9px; border-radius: 999px; display: inline-flex; align-items: center; font-size: 12px; font-weight: 700; }
@@ -92,6 +93,7 @@ svg { width: 18px; height: 18px; stroke-width: 1.8; }
 .small-icon-button:hover { color: var(--text); background: #eef2f5; }
 .small-icon-button.danger:hover { color: var(--red); background: #faecee; }
 .mono { font-family: "Cascadia Code", Consolas, monospace; font-size: 12px; }
+.link-cell { max-width: 380px; color: var(--blue); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .table-wrap { overflow-x: auto; }
 table { width: 100%; min-width: 680px; border-collapse: collapse; }
 th, td { height: 48px; padding: 0 14px; border-bottom: 1px solid var(--line); text-align: left; font-size: 13px; }
@@ -111,6 +113,17 @@ th { color: var(--muted); background: var(--surface-muted); font-size: 11px; tex
 .form-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
 .toast-region { position: fixed; right: 20px; bottom: 20px; z-index: 20; display: grid; gap: 8px; }
 .toast { max-width: 360px; padding: 12px 14px; border-radius: 5px; color: #fff; background: #26323c; box-shadow: var(--shadow); font-size: 13px; }
+.dialog { width: min(520px, calc(100vw - 28px)); padding: 0; border: 1px solid var(--line-strong); border-radius: 6px; color: var(--text); background: var(--surface); box-shadow: 0 24px 70px rgba(20, 29, 37, 0.26); }
+.dialog::backdrop { background: rgba(24, 33, 42, 0.46); }
+.dialog-form { padding: 20px; display: grid; gap: 9px; }
+.dialog-heading { min-height: 44px; display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.dialog-heading h2 { margin: 4px 0 0; font-size: 18px; }
+.dialog-form > label, .two-column-fields label { display: block; margin-top: 6px; font-size: 12px; font-weight: 700; }
+.dialog-form input:not([type="checkbox"]) { width: 100%; height: 40px; margin-top: 5px; padding: 0 11px; border: 1px solid var(--line-strong); border-radius: 5px; }
+.two-column-fields { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 8px; }
+.dialog-copy { margin: 2px 0 6px; color: var(--muted); font-size: 13px; }
+.checkbox-row { min-height: 40px; padding: 0 10px; border: 1px solid var(--line); border-radius: 5px; display: flex !important; align-items: center; gap: 9px; font-weight: 500 !important; }
 
 @media (max-width: 900px) {
   .stat-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -136,6 +149,7 @@ th { color: var(--muted); background: var(--surface-muted); font-size: 11px; tex
   .queue-item { grid-template-columns: minmax(0, 1fr) auto; }
   .queue-status { grid-column: 1 / -1; }
   .settings-form { padding: 14px; }
+  .two-column-fields { grid-template-columns: 1fr; gap: 4px; }
 }
 
 @media (max-width: 420px) {
