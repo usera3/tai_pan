@@ -145,9 +145,17 @@ async def test_download_link_is_valid_for_one_day_without_download_limit():
 
     def handler(request: httpx.Request) -> httpx.Response:
         captured.append(request)
+        if len(captured) == 2:
+            return httpx.Response(
+                200,
+                json={
+                    "status": 1,
+                    "data": [{"dkey": "D1", "link": "https://files.example/D1"}],
+                },
+            )
         return httpx.Response(
             200,
-            json={"status": 1, "data": [{"dkey": "D1", "link": "/d/D1"}]},
+            json={"status": 1, "data": [{"dkey": "D1"}]},
         )
 
     client = TmpLinkClient("test-key", transport=httpx.MockTransport(handler))
@@ -160,7 +168,12 @@ async def test_download_link_is_valid_for_one_day_without_download_limit():
         "ukey": "FILE-UKEY",
         "valid_time": "1440",
     }
-    assert result.data == {"dkey": "D1", "link": "/d/D1"}
+    assert form_data(captured[1]) == {
+        "action": "list_of_direct",
+        "key": "test-key",
+        "page": "1",
+    }
+    assert result.data == {"dkey": "D1", "link": "https://files.example/D1"}
 
 
 @pytest.mark.asyncio

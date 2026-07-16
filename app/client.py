@@ -77,7 +77,17 @@ class TmpLinkClient:
     async def create_download_link(self, ukey: str) -> ServiceResult:
         result = await self.create_link(ukey, valid_time=1440)
         data = result.data[0] if isinstance(result.data, list) and result.data else result.data
-        return ServiceResult(ok=result.ok, data=data, message=result.message)
+        if isinstance(data, dict) and data.get("link"):
+            return ServiceResult(ok=result.ok, data=data, message=result.message)
+
+        dkey = self._extract_dkey(data)
+        if dkey:
+            links = await self.list_links(page=1)
+            for link in links.data if isinstance(links.data, list) else []:
+                if isinstance(link, dict) and link.get("dkey") == dkey and link.get("link"):
+                    return ServiceResult(ok=True, data=link, message=result.message)
+
+        raise TmpLinkBusinessError("直链已创建，但钛盘未返回可用的下载地址")
 
     async def delete_link(self, dkey: str, delete_file: bool = False) -> ServiceResult:
         return await self._direct(
