@@ -32,7 +32,10 @@ class FakeTmpLinkClient:
 
     async def list_links(self, page=1):
         self.calls.append(("list_links", page))
-        return self._result([{"dkey": "D1", "link": "/download/D1"}])
+        return self._result([
+            {"dkey": "D1", "link": "/download/D1"},
+            {"dkey": "D2", "link": "/download/D2"},
+        ])
 
     async def create_link(self, ukey, valid_time=None, download_limit=None):
         self.calls.append(("create_link", ukey, valid_time, download_limit))
@@ -157,6 +160,21 @@ def test_file_download_and_delete_routes_call_expected_methods(client, fake_remo
     assert fake_remote.calls == [
         ("create_download_link", "FILE UKEY"),
         ("delete_file", "FILE UKEY"),
+    ]
+
+
+def test_download_links_are_reused_and_hidden_from_direct_list(client, fake_remote):
+    configure(client)
+
+    first = client.post("/api/files/U1/download")
+    second = client.post("/api/files/U1/download")
+    links = client.get("/api/links?page=1")
+
+    assert first.json()["data"] == second.json()["data"]
+    assert [item["dkey"] for item in links.json()["data"]] == ["D2"]
+    assert fake_remote.calls == [
+        ("create_download_link", "U1"),
+        ("list_links", 1),
     ]
 
 

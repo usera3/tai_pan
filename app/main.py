@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import time
 from typing import Any, Callable
 
 from fastapi import FastAPI, File, Form, Query, Request, UploadFile
@@ -16,6 +17,7 @@ from app.client import (
     TmpLinkTimeoutError,
 )
 from app.config import SettingsStore
+from app.download_registry import DownloadLinkRegistry
 from app.models import ServiceResult
 
 
@@ -45,7 +47,11 @@ def create_app(
     client_factory: Callable[[str], TmpLinkClient] | None = None,
 ) -> FastAPI:
     application = FastAPI(title="TMP Link Manager", docs_url=None, redoc_url=None)
-    store = SettingsStore(settings_path or Path(".local/settings.json"))
+    settings_file = settings_path or Path(".local/settings.json")
+    store = SettingsStore(settings_file)
+    download_registry = DownloadLinkRegistry(
+        Path(settings_file).with_name("download_links.json")
+    )
     make_client = client_factory or (lambda api_key: TmpLinkClient(api_key))
 
     def remote_client():
@@ -112,18 +118,45 @@ def create_app(
 
     @application.post("/api/files/{ukey}/download")
     async def download_file(ukey: str):
-        return result_envelope(await remote_client().create_download_link(ukey))
+        cached = download_registry.active_for(ukey)
+        if cached:
+            return result_envelope(
+                ServiceResult(ok=True, data=cached.as_remote_data())
+            )
+
+        result = await remote_client().create_download_link(ukey)
+        if isinstance(result.data, dict):
+            dkey = result.data.get("dkey") or result.data.get("direct_key")
+            link = result.data.get("link") or result.data.get("url")
+            if dkey and link:
+                download_registry.remember(
+                    ukey,
+                    str(dkey),
+                    str(link),
+                    expires_at=time.time() + 1440 * 60,
+                )
+        return result_envelope(result)
 
     @application.delete("/api/files/{ukey}")
     async def delete_file(ukey: str):
-        return result_envelope(
-            await remote_client().delete_file(ukey),
-            "File deleted",
-        )
+        result = await remote_client().delete_file(ukey)
+        download_registry.forget_ukey(ukey)
+        return result_envelope(result, "File deleted")
 
     @application.get("/api/links")
     async def links(page: int = Query(default=1, ge=1)):
-        return result_envelope(await remote_client().list_links(page))
+        result = await remote_client().list_links(page)
+        hidden = download_registry.hidden_dkeys()
+        data = result.data
+        if isinstance(data, list):
+            data = [
+                link
+                for link in data
+                if not isinstance(link, dict) or link.get("dkey") not in hidden
+            ]
+        return result_envelope(
+            ServiceResult(ok=result.ok, data=data, message=result.message)
+        )
 
     @application.post("/api/links")
     async def create_link(payload: LinkCreate):

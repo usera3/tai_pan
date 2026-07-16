@@ -6,6 +6,8 @@
 
 **Architecture:** Extend `TmpLinkClient` with a 24-hour download-link helper and a composed delete operation that creates a direct link to obtain a DKEY before deleting the link and source file. Expose two local FastAPI routes, then add icon actions and an explicit confirmation dialog to the static SPA.
 
+**Download registry addendum:** Persist automatically generated download links in `.local/download_links.json`. Reuse an entry with at least one hour remaining, filter all registered DKEY values from the direct-link list, and never register user-created links.
+
 **Tech Stack:** Python 3.10, FastAPI, HTTPX, vanilla JavaScript, Lucide, pytest, Playwright.
 
 ## Global Constraints
