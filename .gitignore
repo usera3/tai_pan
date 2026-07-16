@@ -1,1 +1,9 @@
 .worktrees/
+.venv/
+.local/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+test-results/
+playwright-report/
+node_modules/
