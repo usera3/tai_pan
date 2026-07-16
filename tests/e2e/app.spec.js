@@ -1,10 +1,11 @@
 const { test, expect } = require("@playwright/test");
 
-async function mockApi(page) {
+async function mockApi(page, calls = []) {
   await page.route("**/api/**", async (route) => {
     const request = route.request();
     const url = new URL(request.url());
     const path = url.pathname;
+    calls.push(`${request.method()} ${path}`);
     let data = {};
 
     if (path === "/api/settings" && request.method() === "GET") {
@@ -17,6 +18,10 @@ async function mockApi(page) {
       data = { quota: 10737418240 };
     } else if (path === "/api/files") {
       data = [{ ukey: "FILE-UKEY-1", name: "report.pdf", size: 2048 }];
+    } else if (path === "/api/files/FILE-UKEY-1/download" && request.method() === "POST") {
+      data = { dkey: "DOWNLOAD-DKEY", link: "/d/DOWNLOAD-DKEY" };
+    } else if (path === "/api/files/FILE-UKEY-1" && request.method() === "DELETE") {
+      data = { deleted: true };
     } else if (path === "/api/links" && request.method() === "GET") {
       data = [{ dkey: "DIRECT-DKEY-1", name: "report.pdf", link: "/d/DIRECT-DKEY-1", size: 2048, etime: "永久" }];
     } else if (path === "/api/links" && request.method() === "POST") {
@@ -38,7 +43,8 @@ async function mockApi(page) {
 }
 
 test.beforeEach(async ({ page }) => {
-  await mockApi(page);
+  page.apiCalls = [];
+  await mockApi(page, page.apiCalls);
 });
 
 test("navigates dashboard and settings without exposing the key", async ({ page }) => {
@@ -83,6 +89,42 @@ test("creates and deletes a direct link through explicit dialogs", async ({ page
   await page.locator("#delete-file").check();
   await page.locator("#delete-link-submit").click();
   await expect(page.locator("#delete-dialog")).not.toBeVisible();
+});
+
+test("downloads and deletes a file through explicit file actions", async ({ page }) => {
+  await page.addInitScript(() => {
+    window.__downloadTarget = "";
+    window.open = () => ({
+      location: { replace: (value) => { window.__downloadTarget = value; } },
+      close: () => {},
+    });
+  });
+  await page.goto("/#files");
+
+  await page.getByRole("button", { name: "下载文件" }).click();
+  await expect.poll(() => page.evaluate(() => window.__downloadTarget)).toBe("https://pan.cloudcode.xyz/d/DOWNLOAD-DKEY");
+
+  await page.getByRole("button", { name: "删除文件" }).click();
+  await expect(page.locator("#file-delete-dialog")).toBeVisible();
+  await expect(page.locator("#file-delete-dialog")).toContainText("report.pdf");
+  await expect(page.locator("#file-delete-dialog")).toContainText("全部相关直链");
+  await page.locator("#delete-file-submit").click();
+  await expect(page.locator("#file-delete-dialog")).not.toBeVisible();
+  expect(page.apiCalls).toContain("POST /api/files/FILE-UKEY-1/download");
+  expect(page.apiCalls).toContain("DELETE /api/files/FILE-UKEY-1");
+});
+
+test("mobile file actions remain visible before horizontal scrolling", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto("/#files");
+
+  const box = await page.getByRole("button", { name: "下载文件" }).boundingBox();
+
+  await expect(page.getByRole("columnheader", { name: "大小" })).toBeHidden();
+  await expect(page.getByRole("columnheader", { name: "UKEY" })).toBeHidden();
+  expect(box).not.toBeNull();
+  expect(box.x).toBeGreaterThanOrEqual(0);
+  expect(box.x + box.width).toBeLessThanOrEqual(390);
 });
 
 for (const viewport of [
