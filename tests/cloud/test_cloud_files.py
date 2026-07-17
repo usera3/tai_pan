@@ -281,6 +281,8 @@ def test_cloud_download_head_preflight_enforces_owner_and_active_authentication(
     forced = make_tenant("head-forced", must_change_password=True)
     uploaded = cloud_upload(owner, "head.txt", b"head").json()["data"]
     path = f"/api/files/{uploaded['id']}/download?source=cloud"
+    before_file = cloud_app.state.repository.get_cloud_file(owner.id, uploaded["id"])
+    before_audit = cloud_app.state.repository.list_audit_events(owner.id)
 
     owner_get = owner.client.get(path)
     owner_head = owner.client.head(path)
@@ -301,6 +303,8 @@ def test_cloud_download_head_preflight_enforces_owner_and_active_authentication(
 
     assert owner_get.status_code == owner_head.status_code == 200
     assert owner_head.content == b""
+    assert cloud_app.state.repository.get_cloud_file(owner.id, uploaded["id"]) == before_file
+    assert cloud_app.state.repository.list_audit_events(owner.id) == before_audit
     assert [response.status_code for response in responses] == [
         403,
         403,

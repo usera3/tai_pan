@@ -79,6 +79,8 @@ async function mockCloud(page, options = {}) {
       return json(route, { user: state.user, csrf_token: "csrf-rotated" });
     }
     if (url.pathname === "/api/auth/logout") {
+      if (options.logoutFailure === "network") return route.abort("failed");
+      if (options.logoutStatus) return json(route, { detail: options.logoutDetail || "Logout unavailable" }, options.logoutStatus);
       state.authenticated = false;
       return json(route, { message: "Logged out" });
     }
@@ -121,7 +123,10 @@ async function mockCloud(page, options = {}) {
       return json(route, { ok: true, data: null, message: "Direct link deleted" });
     }
     if (url.pathname === "/api/admin/users" && request.method() === "GET") return json(route, state.users);
-    if (url.pathname.startsWith("/api/admin/users/") && url.pathname.endsWith("/reset-password")) return json(route, { user: state.users[1], temporary_password: "temporary-password-value" });
+    if (url.pathname.startsWith("/api/admin/users/") && url.pathname.endsWith("/reset-password")) {
+      if (options.resetResponse) await options.resetResponse;
+      return json(route, { user: state.users[1], temporary_password: "temporary-password-value" });
+    }
     if (url.pathname.startsWith("/api/admin/users/") && request.method() === "PATCH") {
       const target = state.users[1];
       target.status = JSON.parse(record.body).status;
@@ -129,6 +134,7 @@ async function mockCloud(page, options = {}) {
     }
     if (url.pathname === "/api/admin/invitations" && request.method() === "GET") return json(route, state.invitations);
     if (url.pathname === "/api/admin/invitations" && request.method() === "POST") {
+      if (options.invitationResponse) await options.invitationResponse;
       const invitation = { id: "invite-1", status: "available", created_at: "2026-07-17T00:00:00Z", expires_at: null, used_by: null };
       state.invitations.push(invitation);
       return json(route, { invitation, code: "invitation-secret-value" }, 201);
@@ -223,6 +229,59 @@ test("forced password screen lets the user switch accounts with the in-memory CS
 
   await expect(page.locator("#auth-shell")).toBeVisible();
   expect(mutation(state, "/api/auth/logout", "POST").headers["x-csrf-token"]).toBe(state.csrf);
+});
+
+test("logout failures keep the authenticated account and visible error", async ({ page }) => {
+  for (const logoutFailure of [403, 500, "network"]) {
+    const state = await mockCloud(page, { loginUser: admin, logoutFailure: logoutFailure === "network" ? logoutFailure : undefined, logoutStatus: typeof logoutFailure === "number" ? logoutFailure : undefined });
+    await openCloud(page);
+    await signIn(page, "admin");
+
+    await page.locator("#logout-button").click();
+
+    await expect(page.locator("#app-shell")).toBeVisible();
+    await expect(page.locator("#auth-shell")).toBeHidden();
+    await expect(page.locator("#topbar-username")).toHaveText("admin");
+    await expect(page.locator("#logout-button")).toBeEnabled();
+    await expect(page.locator("#toast-region")).not.toBeEmpty();
+    expect(mutation(state, "/api/auth/logout", "POST")).toBeTruthy();
+    await page.reload();
+  }
+});
+
+test("logout failure preserves the forced-password screen and entered password state", async ({ page }) => {
+  const forced = { ...user, username: "forced-failure", must_change_password: true };
+  await mockCloud(page, { loginUser: forced, logoutStatus: 403 });
+  await openCloud(page);
+  await page.locator("#login-username").fill("forced-failure");
+  await page.locator("#login-password").fill("temporary-password");
+  await page.locator("#login-submit").click();
+  await expect(page.locator("#password-shell")).toBeVisible();
+  await page.locator("#current-password").fill("temporary-password");
+  await page.locator("#new-password").fill("replacement-password");
+  await page.locator("#confirm-password").fill("replacement-password");
+
+  await page.locator("#password-logout-button").click();
+
+  await expect(page.locator("#password-shell")).toBeVisible();
+  await expect(page.locator("#auth-shell")).toBeHidden();
+  await expect(page.locator("#password-user")).toHaveText("forced-failure");
+  await expect(page.locator("#current-password")).toHaveValue("temporary-password");
+  await expect(page.locator("#new-password")).toHaveValue("replacement-password");
+  await expect(page.locator("#password-logout-button")).toBeEnabled();
+  await expect(page.locator("#toast-region")).toContainText("没有权限执行此操作");
+});
+
+test("logout error rendering does not expose a response secret", async ({ page }) => {
+  await mockCloud(page, { loginUser: admin, logoutStatus: 500, logoutDetail: "logout-response-secret" });
+  await openCloud(page);
+  await signIn(page, "admin");
+
+  await page.locator("#logout-button").click();
+
+  await expect(page.locator("#app-shell")).toBeVisible();
+  await expect(page.locator("#toast-region")).toContainText("请求失败，请稍后重试");
+  await expect(page.locator("#toast-region")).not.toContainText("logout-response-secret");
 });
 
 test("switching accounts clears queued files before the next user can see or upload them", async ({ page }) => {
@@ -352,6 +411,60 @@ test("admin navigation and controls are role gated", async ({ page }) => {
   await page.locator('[data-user-id="user-1"] [data-action="reset"]').click();
   await page.locator("#confirm-accept").click();
   await expect(page.locator("#secret-value")).toHaveValue("temporary-password-value");
+});
+
+test("a delayed password reset never exposes its secret to the next account", async ({ page }) => {
+  let releaseReset;
+  const resetResponse = new Promise((resolve) => { releaseReset = resolve; });
+  const second = { ...user, id: "second-user", username: "second-user" };
+  const state = await mockCloud(page, { loginUsers: { admin, "second-user": second }, resetResponse });
+  await openCloud(page);
+  await signIn(page, "admin");
+  await page.locator('[data-view="admin"]').click();
+  await expect(page.locator('[data-user-id="user-1"] [data-action="reset"]')).toBeVisible();
+  await page.locator('[data-user-id="user-1"] [data-action="reset"]').click();
+  await page.locator("#confirm-accept").click();
+  await expect.poll(() => Boolean(mutation(state, "/api/admin/users/user-1/reset-password", "POST"))).toBe(true);
+
+  await page.locator("#logout-button").click();
+  await signIn(page, "second-user");
+  const adminLoads = state.requests.filter((request) => request.path === "/api/admin/users" && request.method === "GET").length;
+  releaseReset();
+
+  await expect(page.locator("#secret-dialog")).toBeHidden();
+  await expect(page.locator("#confirm-dialog")).toBeHidden();
+  await expect(page.locator("#invitation-dialog")).toBeHidden();
+  await expect(page.locator("#topbar-username")).toHaveText("second-user");
+  await expect(page.locator('[data-view="admin"]')).toHaveCount(0);
+  await expect.poll(() => state.requests.filter((request) => request.path === "/api/admin/users" && request.method === "GET").length).toBe(adminLoads);
+  await expect(page.locator("#secret-value")).toHaveValue("");
+});
+
+test("a delayed invitation never exposes its code to the next account", async ({ page }) => {
+  let releaseInvitation;
+  const invitationResponse = new Promise((resolve) => { releaseInvitation = resolve; });
+  const second = { ...user, id: "second-user", username: "second-user" };
+  const state = await mockCloud(page, { loginUsers: { admin, "second-user": second }, invitationResponse });
+  await openCloud(page);
+  await signIn(page, "admin");
+  await page.locator('[data-view="admin"]').click();
+  await page.locator("#create-invitation").click();
+  await page.locator("#invitation-submit").click();
+  await expect.poll(() => Boolean(mutation(state, "/api/admin/invitations", "POST"))).toBe(true);
+  await page.locator("#invitation-cancel").click();
+
+  await page.locator("#logout-button").click();
+  await signIn(page, "second-user");
+  const adminLoads = state.requests.filter((request) => request.path === "/api/admin/invitations" && request.method === "GET").length;
+  releaseInvitation();
+
+  await expect(page.locator("#secret-dialog")).toBeHidden();
+  await expect(page.locator("#invitation-dialog")).toBeHidden();
+  await expect(page.locator("#confirm-dialog")).toBeHidden();
+  await expect(page.locator("#topbar-username")).toHaveText("second-user");
+  await expect(page.locator('[data-view="admin"]')).toHaveCount(0);
+  await expect.poll(() => state.requests.filter((request) => request.path === "/api/admin/invitations" && request.method === "GET").length).toBe(adminLoads);
+  await expect(page.locator("#secret-value")).toHaveValue("");
 });
 
 test("disabled login has a complete error state", async ({ page }) => {

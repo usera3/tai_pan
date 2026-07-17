@@ -50,14 +50,13 @@ function toast(message) {
   window.setTimeout(() => item.remove(), 3200);
 }
 
-function errorMessage(status, detail) {
+function errorMessage(status) {
   if (status === 401) return "用户名或密码不正确";
   if (status === 403) return "没有权限执行此操作";
   if (status === 409) return "当前状态不允许此操作";
   if (status === 413) return "文件超过大小或空间限制";
   if (status === 422) return "提交内容无效";
   if (status === 429) return "操作过于频繁，请稍后再试";
-  if (typeof detail === "string" && detail.length <= 120) return detail;
   return "请求失败，请稍后重试";
 }
 
@@ -75,7 +74,7 @@ async function api(path, options = {}) {
   try { payload = await response.json(); } catch (_error) { payload = {}; }
   if (!response.ok) {
     if (response.status === 401 && state.user) showAuth("会话已失效，请重新登录");
-    const error = new Error(errorMessage(response.status, payload.detail || payload.message));
+    const error = new Error(errorMessage(response.status));
     error.status = response.status;
     throw error;
   }
@@ -301,9 +300,14 @@ async function changePassword(event) {
 async function logout(event) {
   const button = event?.currentTarget || byId("logout-button");
   setBusy(button, true, "");
-  try { await api("/api/auth/logout", { method: "POST" }); } catch (error) { toast(error.message); }
-  showAuth();
-  setBusy(button, false);
+  try {
+    await api("/api/auth/logout", { method: "POST" });
+    showAuth();
+  } catch (error) {
+    if (error.status !== 401) toast(error.message);
+  } finally {
+    setBusy(button, false);
+  }
 }
 
 function activateView(name) {
@@ -573,7 +577,7 @@ function uploadItem(item) {
         item.message = "完成";
       } else {
         item.status = "failed";
-        item.message = errorMessage(xhr.status, payload.detail || payload.message);
+        item.message = errorMessage(xhr.status);
       }
       renderUploads();
       resolve();
@@ -794,16 +798,24 @@ function renderUsers() {
 }
 
 async function updateUserStatus(user, status) {
-  try { await api(`/api/admin/users/${encodeURIComponent(user.id)}`, { method: "PATCH", body: { status } }); await loadAdmin(); toast(status === "active" ? "用户已恢复" : "用户已停用"); }
-  catch (error) { toast(error.message); }
+  const generation = state.generation;
+  try {
+    await api(`/api/admin/users/${encodeURIComponent(user.id)}`, { method: "PATCH", body: { status } });
+    if (generation !== state.generation) return;
+    await loadAdmin();
+    if (generation !== state.generation) return;
+    toast(status === "active" ? "用户已恢复" : "用户已停用");
+  } catch (error) { if (generation === state.generation) toast(error.message); }
 }
 
 async function resetUserPassword(user) {
+  const generation = state.generation;
   try {
     const payload = await api(`/api/admin/users/${encodeURIComponent(user.id)}/reset-password`, { method: "POST" });
+    if (generation !== state.generation) return;
     showSecret("临时密码", payload.temporary_password);
     await loadAdmin();
-  } catch (error) { toast(error.message); }
+  } catch (error) { if (generation === state.generation) toast(error.message); }
 }
 
 function invitationStatus(item) {
@@ -819,7 +831,7 @@ function renderInvitations() {
     const created = document.createElement("td"); created.textContent = formatDate(item.created_at);
     const expiry = document.createElement("td"); expiry.textContent = item.expires_at ? formatDate(item.expires_at) : "不限";
     const actions = document.createElement("td"); actions.className = "row-actions";
-    if (item.status === "available") { const revoke = iconButton("trash-2", "撤销邀请", "revoke", "danger"); revoke.addEventListener("click", () => openConfirm("撤销邀请", "确认撤销此邀请码？", async () => { try { await api(`/api/admin/invitations/${encodeURIComponent(item.id)}`, { method: "DELETE" }); await loadAdmin(); } catch (error) { toast(error.message); } })); actions.append(revoke); }
+    if (item.status === "available") { const revoke = iconButton("trash-2", "撤销邀请", "revoke", "danger"); revoke.addEventListener("click", () => openConfirm("撤销邀请", "确认撤销此邀请码？", () => revokeInvitation(item))); actions.append(revoke); }
     row.append(statusCell, created, expiry, actions); body.append(row);
   });
   byId("invitations-state").hidden = true; byId("invitations-table-wrap").hidden = false; initIcons();
@@ -833,13 +845,24 @@ function formatDate(value) {
 
 async function createInvitation(event) {
   event.preventDefault();
+  const generation = state.generation;
   const button = byId("invitation-submit"); setBusy(button, true, "创建中");
   const value = byId("invitation-expiry").value;
   try {
     const payload = await api("/api/admin/invitations", { method: "POST", body: { expires_at: value ? new Date(value).toISOString() : null } });
+    if (generation !== state.generation) return;
     byId("invitation-dialog").close(); byId("invitation-form").reset(); showSecret("邀请码", payload.code); await loadAdmin();
-  } catch (error) { setMessage(byId("invitation-message"), error.message, "error"); }
-  finally { setBusy(button, false); }
+  } catch (error) { if (generation === state.generation) setMessage(byId("invitation-message"), error.message, "error"); }
+  finally { if (generation === state.generation) setBusy(button, false); }
+}
+
+async function revokeInvitation(item) {
+  const generation = state.generation;
+  try {
+    await api(`/api/admin/invitations/${encodeURIComponent(item.id)}`, { method: "DELETE" });
+    if (generation !== state.generation) return;
+    await loadAdmin();
+  } catch (error) { if (generation === state.generation) toast(error.message); }
 }
 
 function showSecret(title, value) {
