@@ -344,6 +344,118 @@ class CloudRepository:
                 raise
         return _invitation_from_row(row)
 
+    def register_user_with_invitation(
+        self,
+        *,
+        username: str,
+        password_hash: str,
+        invitation_code: str,
+        now: datetime | None = None,
+    ) -> User | None:
+        timestamp = now or _now()
+        serialized_now = _serialize_datetime(timestamp)
+        user_id = str(uuid4())
+        normalized_username = normalize_username(username)
+        with closing(self._database.connection()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                invitation = connection.execute(
+                    """
+                    SELECT id FROM invitations
+                    WHERE code_hash = ?
+                      AND used_by IS NULL
+                      AND (expires_at IS NULL OR expires_at > ?)
+                    """,
+                    (hash_secret(invitation_code), serialized_now),
+                ).fetchone()
+                if invitation is None:
+                    connection.rollback()
+                    return None
+
+                connection.execute(
+                    """
+                    INSERT INTO users (
+                        id, username, password_hash, role, status,
+                        must_change_password, created_at, updated_at
+                    ) VALUES (?, ?, ?, 'user', 'active', 0, ?, ?)
+                    """,
+                    (
+                        user_id,
+                        normalized_username,
+                        password_hash,
+                        serialized_now,
+                        serialized_now,
+                    ),
+                )
+                cursor = connection.execute(
+                    """
+                    UPDATE invitations SET used_by = ?, used_at = ?
+                    WHERE id = ? AND used_by IS NULL
+                    """,
+                    (user_id, serialized_now, invitation["id"]),
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError("invitation could not be consumed")
+                row = connection.execute(
+                    "SELECT * FROM users WHERE id = ?", (user_id,)
+                ).fetchone()
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        return _user_from_row(row)
+
+    def update_password_and_revoke_sessions(
+        self,
+        user_id: str,
+        password_hash: str,
+        *,
+        now: datetime | None = None,
+    ) -> User | None:
+        serialized_now = _serialize_datetime(now or _now())
+        with closing(self._database.connection()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = connection.execute(
+                    """
+                    UPDATE users
+                    SET password_hash = ?, must_change_password = 0, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (password_hash, serialized_now, user_id),
+                )
+                if cursor.rowcount != 1:
+                    connection.rollback()
+                    return None
+                connection.execute(
+                    """
+                    UPDATE sessions SET revoked_at = ?
+                    WHERE user_id = ? AND revoked_at IS NULL
+                    """,
+                    (serialized_now, user_id),
+                )
+                row = connection.execute(
+                    "SELECT * FROM users WHERE id = ?", (user_id,)
+                ).fetchone()
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        return _user_from_row(row)
+
+    def record_login(self, user_id: str, *, now: datetime | None = None) -> User | None:
+        with closing(self._database.connection()) as connection, connection:
+            cursor = connection.execute(
+                "UPDATE users SET last_login_at = ? WHERE id = ?",
+                (_serialize_datetime(now or _now()), user_id),
+            )
+            if cursor.rowcount != 1:
+                return None
+            row = connection.execute(
+                "SELECT * FROM users WHERE id = ?", (user_id,)
+            ).fetchone()
+        return _user_from_row(row)
+
     def create_session(
         self,
         user_id: str,
@@ -766,4 +878,17 @@ class CloudRepository:
         query = "SELECT COUNT(*) FROM auth_attempts WHERE " + " AND ".join(clauses)
         with closing(self._database.connection()) as connection:
             row = connection.execute(query, parameters).fetchone()
+        return int(row[0])
+
+    def count_registration_attempts(
+        self, *, since: datetime, remote_addr: str
+    ) -> int:
+        with closing(self._database.connection()) as connection:
+            row = connection.execute(
+                """
+                SELECT COUNT(*) FROM auth_attempts
+                WHERE username IS NULL AND remote_addr = ? AND created_at >= ?
+                """,
+                (remote_addr, _serialize_datetime(since)),
+            ).fetchone()
         return int(row[0])

@@ -119,6 +119,64 @@ def test_expired_invitation_cannot_be_consumed(repository: CloudRepository):
     assert repository.consume_invitation(code, used_by=user.id, now=NOW) is None
 
 
+def test_invited_user_creation_rolls_back_invitation_on_duplicate_username(
+    repository: CloudRepository,
+):
+    admin = create_user(repository, "registration-admin")
+    create_user(repository, "existing-registration-user")
+    code = "registration-remains-usable"
+    repository.create_invitation(created_by=admin.id, code=code, now=NOW)
+
+    with pytest.raises(sqlite3.IntegrityError):
+        repository.register_user_with_invitation(
+            username="existing-registration-user",
+            password_hash="first-password-hash",
+            invitation_code=code,
+            now=NOW,
+        )
+
+    registered = repository.register_user_with_invitation(
+        username="new-registration-user",
+        password_hash="second-password-hash",
+        invitation_code=code,
+        now=NOW,
+    )
+
+    assert registered is not None
+    assert registered.username == "new-registration-user"
+    assert repository.get_user_by_username("new-registration-user") == registered
+
+
+def test_invited_user_creation_is_single_use_under_concurrency(
+    repository: CloudRepository,
+):
+    admin = create_user(repository, "concurrent-registration-admin")
+    code = "concurrent-registration-code"
+    repository.create_invitation(created_by=admin.id, code=code, now=NOW)
+    barrier = Barrier(2)
+
+    def register(username: str):
+        barrier.wait()
+        return repository.register_user_with_invitation(
+            username=username,
+            password_hash=f"hash-for-{username}",
+            invitation_code=code,
+            now=NOW,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(register, ["concurrent-one", "concurrent-two"]))
+
+    registered = [result for result in results if result is not None]
+    assert len(registered) == 1
+    assert registered[0].username in {"concurrent-one", "concurrent-two"}
+    created = [
+        repository.get_user_by_username(username)
+        for username in ("concurrent-one", "concurrent-two")
+    ]
+    assert len([user for user in created if user is not None]) == 1
+
+
 def test_sessions_store_only_hashes_support_opaque_lookup_and_scoped_revocation(
     repository: CloudRepository, database: Database
 ):

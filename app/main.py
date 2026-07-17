@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import time
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from fastapi import FastAPI, File, Form, Query, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response
@@ -207,4 +208,20 @@ def result_envelope(result: ServiceResult, default_message: str = "") -> dict[st
     )
 
 
-app = create_app()
+def create_selected_app(environ: Mapping[str, str] | None = None) -> FastAPI:
+    from app.cloud.config import CloudConfig
+
+    config = CloudConfig.from_env(environ if environ is not None else os.environ)
+    if config.mode == "local":
+        application = create_app()
+        application.state.mode = "local"
+        return application
+
+    from app.cloud.app import create_cloud_app
+    from app.cloud.db import Database
+
+    assert config.database_path is not None
+    return create_cloud_app(config, Database(config.database_path))
+
+
+app = create_selected_app()
