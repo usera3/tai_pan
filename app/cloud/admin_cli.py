@@ -3,13 +3,14 @@ from __future__ import annotations
 import argparse
 import ctypes
 import errno
+import fcntl
 import json
 import os
 import secrets
 import stat
 import sys
 from contextlib import closing
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -26,10 +27,9 @@ class BootstrapError(RuntimeError):
 @dataclass
 class _PendingCredentials:
     name: str
-    anchor_name: str
     username: str
-    temporary_password: str
-    descriptor: int
+    temporary_password: str = field(repr=False)
+    descriptor: int = field(repr=False)
     device: int
     inode: int
 
@@ -39,12 +39,25 @@ class _PendingCredentials:
             self.descriptor = -1
 
 
+@dataclass
+class _BootstrapLock:
+    descriptor: int = field(repr=False)
+
+    def close(self) -> None:
+        if self.descriptor >= 0:
+            try:
+                fcntl.flock(self.descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(self.descriptor)
+                self.descriptor = -1
+
+
 def _pending_name(final_name: str) -> str:
     return f".{final_name}.pending"
 
 
-def _anchor_name(pending_name: str) -> str:
-    return f"{pending_name}.pin"
+def _lock_name(final_name: str) -> str:
+    return f".{final_name}.lock"
 
 
 def _directory_flags() -> int:
@@ -58,6 +71,7 @@ def _directory_flags() -> int:
 
 def _open_credentials_directory(path: Path) -> int:
     absolute_parent = path.absolute().parent
+    descriptor: int | None = None
     try:
         descriptor = os.open(os.path.sep, _directory_flags())
         for component in absolute_parent.parts[1:]:
@@ -65,10 +79,8 @@ def _open_credentials_directory(path: Path) -> int:
             os.close(descriptor)
             descriptor = next_descriptor
     except OSError:
-        try:
+        if descriptor is not None:
             os.close(descriptor)
-        except (NameError, OSError):
-            pass
         raise BootstrapError("Credentials directory is not safe") from None
 
     metadata = os.fstat(descriptor)
@@ -92,6 +104,34 @@ def _entry_metadata(directory_fd: int, name: str):
 
 def _entry_exists(directory_fd: int, name: str) -> bool:
     return _entry_metadata(directory_fd, name) is not None
+
+
+def _acquire_bootstrap_lock(directory_fd: int, name: str) -> _BootstrapLock:
+    flags = os.O_RDWR | os.O_CREAT
+    flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(name, flags, 0o600, dir_fd=directory_fd)
+    except OSError:
+        raise BootstrapError("Bootstrap lock is not safe") from None
+    try:
+        os.fchmod(descriptor, 0o600)
+        metadata = os.fstat(descriptor)
+        named_metadata = _entry_metadata(directory_fd, name)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_uid != os.geteuid()
+            or named_metadata is None
+            or named_metadata.st_dev != metadata.st_dev
+            or named_metadata.st_ino != metadata.st_ino
+        ):
+            raise BootstrapError("Bootstrap lock is not safe")
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        os.fsync(directory_fd)
+        return _BootstrapLock(descriptor)
+    except BaseException:
+        os.close(descriptor)
+        raise
 
 
 def _validate_pending_metadata(metadata: os.stat_result) -> None:
@@ -144,7 +184,6 @@ def _read_pending_credentials(directory_fd: int, name: str) -> _PendingCredentia
         payload = _parse_pending_payload(b"".join(chunks))
         return _PendingCredentials(
             name=name,
-            anchor_name=_anchor_name(name),
             username=payload["username"],
             temporary_password=payload["temporary_password"],
             descriptor=descriptor,
@@ -156,9 +195,7 @@ def _read_pending_credentials(directory_fd: int, name: str) -> _PendingCredentia
         raise
 
 
-def _same_directory_entry(
-    directory_fd: int, pending: _PendingCredentials
-) -> bool:
+def _same_directory_entry(directory_fd: int, pending: _PendingCredentials) -> bool:
     metadata = _entry_metadata(directory_fd, pending.name)
     return bool(
         metadata is not None
@@ -168,9 +205,7 @@ def _same_directory_entry(
     )
 
 
-def _unlink_pending_if_same(
-    directory_fd: int, pending: _PendingCredentials
-) -> bool:
+def _unlink_pending_if_same(directory_fd: int, pending: _PendingCredentials) -> bool:
     if not _same_directory_entry(directory_fd, pending):
         return False
     os.unlink(pending.name, dir_fd=directory_fd)
@@ -178,20 +213,23 @@ def _unlink_pending_if_same(
     return True
 
 
-def _unlink_anchor_if_same(
-    directory_fd: int, pending: _PendingCredentials
-) -> bool:
-    metadata = _entry_metadata(directory_fd, pending.anchor_name)
-    if not (
-        metadata is not None
-        and metadata.st_dev == pending.device
-        and metadata.st_ino == pending.inode
-        and stat.S_ISREG(metadata.st_mode)
-    ):
-        return False
-    os.unlink(pending.anchor_name, dir_fd=directory_fd)
-    os.fsync(directory_fd)
-    return True
+def _cleanup_created_pending(
+    directory_fd: int, name: str, descriptor: int | None
+) -> None:
+    if descriptor is None:
+        return
+    try:
+        metadata = os.fstat(descriptor)
+        named_metadata = _entry_metadata(directory_fd, name)
+        if (
+            named_metadata is not None
+            and named_metadata.st_dev == metadata.st_dev
+            and named_metadata.st_ino == metadata.st_ino
+        ):
+            os.unlink(name, dir_fd=directory_fd)
+            os.fsync(directory_fd)
+    except BaseException:
+        pass
 
 
 def _write_pending_credentials(
@@ -201,25 +239,17 @@ def _write_pending_credentials(
     username: str,
     temporary_password: str,
 ) -> _PendingCredentials:
-    try:
-        raw_payload = (
-            json.dumps(
-                {
-                    "username": username,
-                    "temporary_password": temporary_password,
-                },
-                ensure_ascii=True,
-                separators=(",", ":"),
-            )
-            + "\n"
-        ).encode("utf-8")
-    except BaseException:
-        raise
-
+    raw_payload = (
+        json.dumps(
+            {"username": username, "temporary_password": temporary_password},
+            ensure_ascii=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode("utf-8")
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     descriptor: int | None = None
-    pending: _PendingCredentials | None = None
     try:
         descriptor = os.open(name, flags, 0o600, dir_fd=directory_fd)
         os.fchmod(descriptor, 0o600)
@@ -227,7 +257,6 @@ def _write_pending_credentials(
         _validate_pending_metadata(metadata)
         pending = _PendingCredentials(
             name=name,
-            anchor_name=_anchor_name(name),
             username=username,
             temporary_password=temporary_password,
             descriptor=descriptor,
@@ -241,68 +270,51 @@ def _write_pending_credentials(
                 raise OSError("credential write did not make progress")
             offset += written
         os.fsync(descriptor)
-        _ensure_pending_anchor(directory_fd, pending)
         os.fsync(directory_fd)
         return pending
     except BaseException:
-        if pending is not None:
-            pending.close()
-            try:
-                _unlink_pending_if_same(directory_fd, pending)
-                _unlink_anchor_if_same(directory_fd, pending)
-            except BaseException:
-                pass
-        elif descriptor is not None:
+        _cleanup_created_pending(directory_fd, name, descriptor)
+        if descriptor is not None:
             os.close(descriptor)
         raise
 
 
-_AT_EMPTY_PATH = 0x1000
+_RENAME_NOREPLACE = 1
 _LIBC = ctypes.CDLL(None, use_errno=True)
+_RENAMEAT2 = getattr(_LIBC, "renameat2", None)
 
 
-def _link_pending_no_replace(
-    directory_fd: int,
-    pending: _PendingCredentials,
-    final_name: str,
-) -> None:
-    linkat = getattr(_LIBC, "linkat", None)
-    if linkat is None:
+def _require_secure_rename() -> None:
+    if _RENAMEAT2 is None:
         raise BootstrapError("Secure credential publication is unavailable")
-    result = linkat(
-        pending.descriptor,
-        ctypes.c_char_p(b""),
-        directory_fd,
-        ctypes.c_char_p(os.fsencode(final_name)),
-        _AT_EMPTY_PATH,
-    )
-    if result == 0:
-        return
-    error_number = ctypes.get_errno()
-    if error_number == errno.EEXIST:
-        raise BootstrapError("Credentials file already exists")
-    raise BootstrapError("Credentials file could not be published")
-
-
-def _ensure_pending_anchor(
-    directory_fd: int, pending: _PendingCredentials
-) -> None:
-    metadata = _entry_metadata(directory_fd, pending.anchor_name)
-    if metadata is not None:
-        if metadata.st_dev == pending.device and metadata.st_ino == pending.inode:
-            return
-        raise BootstrapError("Pending credential anchor is not safe")
-    _link_pending_no_replace(directory_fd, pending, pending.anchor_name)
 
 
 def _rename_pending_credentials(
-    directory_fd: int,
-    pending: _PendingCredentials,
-    final_name: str,
+    directory_fd: int, pending: _PendingCredentials, final_name: str
 ) -> None:
-    _link_pending_no_replace(directory_fd, pending, final_name)
-    _unlink_pending_if_same(directory_fd, pending)
-    _unlink_anchor_if_same(directory_fd, pending)
+    if not _same_directory_entry(directory_fd, pending):
+        raise BootstrapError("Pending credentials changed during publication")
+    _require_secure_rename()
+    result = _RENAMEAT2(
+        directory_fd,
+        ctypes.c_char_p(os.fsencode(pending.name)),
+        directory_fd,
+        ctypes.c_char_p(os.fsencode(final_name)),
+        _RENAME_NOREPLACE,
+    )
+    if result != 0:
+        error_number = ctypes.get_errno()
+        if error_number == errno.EEXIST:
+            raise BootstrapError("Credentials file already exists")
+        raise BootstrapError("Credentials file could not be published")
+    final_metadata = _entry_metadata(directory_fd, final_name)
+    if (
+        final_metadata is None
+        or final_metadata.st_dev != pending.device
+        or final_metadata.st_ino != pending.inode
+        or not stat.S_ISREG(final_metadata.st_mode)
+    ):
+        raise BootstrapError("Published credentials could not be verified")
     os.fsync(directory_fd)
 
 
@@ -314,10 +326,7 @@ def _find_admin(database: Database):
 
 
 def _matching_admin(
-    database: Database,
-    *,
-    username: str,
-    temporary_password: str,
+    database: Database, *, username: str, temporary_password: str
 ):
     row = _find_admin(database)
     if row is None or row["username"] != username:
@@ -347,34 +356,40 @@ def _finalize_recoverable_pending(
     return str(row["id"])
 
 
-def _close_connection(connection) -> None:
+def _close_quietly(resource) -> None:
     try:
-        connection.close()
+        resource.close()
     except BaseException:
         pass
 
 
 def bootstrap_initial_admin(
-    *,
-    database: Database,
-    username: str,
-    credentials_file: Path | str,
+    *, database: Database, username: str, credentials_file: Path | str
 ) -> str:
+    try:
+        normalized_username = normalize_username(username)
+    except ValueError:
+        raise BootstrapError("Initial administrator could not be created") from None
     credential_path = Path(credentials_file)
-    normalized_username = normalize_username(username)
-    database.initialize()
+    if credential_path.name in {"", ".", ".."}:
+        raise BootstrapError("Initial administrator could not be created")
     directory_fd = _open_credentials_directory(credential_path)
-    final_name = credential_path.name
-    pending_name = _pending_name(final_name)
+    bootstrap_lock: _BootstrapLock | None = None
     active_pending: _PendingCredentials | None = None
     try:
+        _require_secure_rename()
+        bootstrap_lock = _acquire_bootstrap_lock(
+            directory_fd, _lock_name(credential_path.name)
+        )
+        database.initialize()
+        final_name = credential_path.name
+        pending_name = _pending_name(final_name)
+
         if _entry_exists(directory_fd, final_name):
             raise BootstrapError("Initial administrator could not be created")
 
         if _entry_exists(directory_fd, pending_name):
             active_pending = _read_pending_credentials(directory_fd, pending_name)
-            _ensure_pending_anchor(directory_fd, active_pending)
-            os.fsync(directory_fd)
             recovered_id = _finalize_recoverable_pending(
                 database=database,
                 directory_fd=directory_fd,
@@ -387,7 +402,6 @@ def bootstrap_initial_admin(
                 raise BootstrapError("Initial administrator already exists")
             if not _unlink_pending_if_same(directory_fd, active_pending):
                 raise BootstrapError("Pending credentials changed during recovery")
-            _unlink_anchor_if_same(directory_fd, active_pending)
             active_pending.close()
             active_pending = None
 
@@ -408,10 +422,9 @@ def bootstrap_initial_admin(
         connection = database.connection()
         try:
             connection.execute("BEGIN IMMEDIATE")
-            existing_admin = connection.execute(
+            if connection.execute(
                 "SELECT 1 FROM users WHERE role = 'admin' LIMIT 1"
-            ).fetchone()
-            if existing_admin is not None:
+            ).fetchone() is not None:
                 raise BootstrapError("Initial administrator already exists")
             connection.execute(
                 """
@@ -420,13 +433,7 @@ def bootstrap_initial_admin(
                     must_change_password, created_at, updated_at
                 ) VALUES (?, ?, ?, 'admin', 'active', 1, ?, ?)
                 """,
-                (
-                    user_id,
-                    normalized_username,
-                    password_hash,
-                    timestamp,
-                    timestamp,
-                ),
+                (user_id, normalized_username, password_hash, timestamp, timestamp),
             )
             connection.commit()
         except BaseException as error:
@@ -434,7 +441,7 @@ def bootstrap_initial_admin(
                 connection.rollback()
             except BaseException:
                 pass
-            _close_connection(connection)
+            _close_quietly(connection)
             try:
                 recovered_id = _finalize_recoverable_pending(
                     database=database,
@@ -443,21 +450,20 @@ def bootstrap_initial_admin(
                     final_name=final_name,
                 )
             except BaseException:
-                # An indeterminate verification or publication failure must retain
-                # the complete pending credential for a later recovery attempt.
-                raise BootstrapError("Initial administrator state requires recovery") from None
+                raise BootstrapError(
+                    "Initial administrator state requires recovery"
+                ) from None
             if recovered_id is not None:
                 return recovered_id
             if not _unlink_pending_if_same(directory_fd, active_pending):
                 raise BootstrapError("Pending credentials changed during recovery")
-            _unlink_anchor_if_same(directory_fd, active_pending)
             if isinstance(error, (KeyboardInterrupt, SystemExit)):
                 raise
             if isinstance(error, BootstrapError):
                 raise
             raise BootstrapError("Initial administrator could not be created") from None
         else:
-            _close_connection(connection)
+            _close_quietly(connection)
 
         _rename_pending_credentials(directory_fd, active_pending, final_name)
         return user_id
@@ -469,8 +475,13 @@ def bootstrap_initial_admin(
         raise BootstrapError("Initial administrator could not be created") from None
     finally:
         if active_pending is not None:
-            active_pending.close()
-        os.close(directory_fd)
+            _close_quietly(active_pending)
+        if bootstrap_lock is not None:
+            _close_quietly(bootstrap_lock)
+        try:
+            os.close(directory_fd)
+        except OSError:
+            pass
 
 
 def _parser() -> argparse.ArgumentParser:

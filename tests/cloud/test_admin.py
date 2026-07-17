@@ -6,6 +6,8 @@ import sqlite3
 import stat
 import subprocess
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -1186,12 +1188,10 @@ def test_initial_admin_bootstrap_never_replaces_racing_final_entry(
 
     database = Database(tmp_path / "bootstrap.db")
     credentials_file = tmp_path / "racing-final.json"
-    original_link = admin_cli._link_pending_no_replace
+    original_rename = admin_cli._rename_pending_credentials
     sentinel = b"do-not-overwrite"
 
-    def create_final_then_link(directory_fd, pending, final_name):
-        if final_name != credentials_file.name:
-            return original_link(directory_fd, pending, final_name)
+    def create_final_then_rename(directory_fd, pending, final_name):
         descriptor = os.open(
             final_name,
             os.O_WRONLY | os.O_CREAT | os.O_EXCL,
@@ -1202,9 +1202,13 @@ def test_initial_admin_bootstrap_never_replaces_racing_final_entry(
             os.write(descriptor, sentinel)
         finally:
             os.close(descriptor)
-        return original_link(directory_fd, pending, final_name)
+        return original_rename(directory_fd, pending, final_name)
 
-    monkeypatch.setattr(admin_cli, "_link_pending_no_replace", create_final_then_link)
+    monkeypatch.setattr(
+        admin_cli,
+        "_rename_pending_credentials",
+        create_final_then_rename,
+    )
 
     with pytest.raises(admin_cli.BootstrapError):
         admin_cli.bootstrap_initial_admin(
@@ -1217,38 +1221,50 @@ def test_initial_admin_bootstrap_never_replaces_racing_final_entry(
     assert pending_credentials_path(credentials_file).exists()
 
 
-def test_initial_admin_bootstrap_publishes_pinned_pending_inode(
+def test_initial_admin_bootstrap_serializes_concurrent_invocations(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     import app.cloud.admin_cli as admin_cli
 
     database = Database(tmp_path / "bootstrap.db")
-    credentials_file = tmp_path / "pinned-pending.json"
-    replacement_target = tmp_path / "replacement-target"
-    replacement_target.write_text("attacker-controlled", encoding="utf-8")
-    original_link = admin_cli._link_pending_no_replace
+    credentials_file = tmp_path / "concurrent-bootstrap.json"
+    barrier = threading.Barrier(2)
+    original_acquire = admin_cli._acquire_bootstrap_lock
 
-    def replace_name_then_link(directory_fd, pending, final_name):
-        if final_name != credentials_file.name:
-            return original_link(directory_fd, pending, final_name)
-        os.unlink(pending.name, dir_fd=directory_fd)
-        os.symlink(replacement_target, pending.name, dir_fd=directory_fd)
-        return original_link(directory_fd, pending, final_name)
+    def synchronized_acquire(directory_fd, name):
+        barrier.wait(timeout=5)
+        return original_acquire(directory_fd, name)
 
-    monkeypatch.setattr(admin_cli, "_link_pending_no_replace", replace_name_then_link)
+    monkeypatch.setattr(admin_cli, "_acquire_bootstrap_lock", synchronized_acquire)
 
-    user_id = admin_cli.bootstrap_initial_admin(
-        database=database,
-        username="bootstrap-admin",
-        credentials_file=credentials_file,
-    )
+    def invoke():
+        try:
+            return (
+                "created",
+                admin_cli.bootstrap_initial_admin(
+                    database=database,
+                    username="bootstrap-admin",
+                    credentials_file=credentials_file,
+                ),
+            )
+        except admin_cli.BootstrapError:
+            return ("rejected", None)
 
-    assert user_id
-    assert not credentials_file.is_symlink()
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda _: invoke(), range(2)))
+
+    assert [result[0] for result in results].count("created") == 1
+    assert [result[0] for result in results].count("rejected") == 1
     credentials = json.loads(credentials_file.read_text(encoding="utf-8"))
     assert credentials["username"] == "bootstrap-admin"
-    assert pending_credentials_path(credentials_file).is_symlink()
-    assert replacement_target.read_text(encoding="utf-8") == "attacker-controlled"
+    with database.connection() as connection:
+        rows = connection.execute(
+            "SELECT id, password_hash FROM users WHERE role = 'admin'"
+        ).fetchall()
+    assert len(rows) == 1
+    assert PasswordService().verify(
+        rows[0]["password_hash"], credentials["temporary_password"]
+    )
 
 
 def test_initial_admin_bootstrap_cleans_interrupted_pending_write(
@@ -1279,6 +1295,63 @@ def test_initial_admin_bootstrap_cleans_interrupted_pending_write(
 
     assert not credentials_file.exists()
     assert not pending_credentials_path(credentials_file).exists()
+
+
+@pytest.mark.parametrize("failure_point", ["fchmod", "metadata"])
+def test_initial_admin_bootstrap_cleans_pre_metadata_pending_interrupt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_point: str,
+):
+    import app.cloud.admin_cli as admin_cli
+
+    database = Database(tmp_path / "bootstrap.db")
+    credentials_file = tmp_path / f"interrupted-{failure_point}.json"
+    if failure_point == "fchmod":
+        original_fchmod = os.fchmod
+        calls = 0
+
+        def interrupt_pending_fchmod(descriptor: int, mode: int):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise KeyboardInterrupt
+            return original_fchmod(descriptor, mode)
+
+        monkeypatch.setattr(admin_cli.os, "fchmod", interrupt_pending_fchmod)
+    else:
+        monkeypatch.setattr(
+            admin_cli,
+            "_validate_pending_metadata",
+            lambda metadata: (_ for _ in ()).throw(KeyboardInterrupt()),
+        )
+
+    with pytest.raises(KeyboardInterrupt):
+        admin_cli.bootstrap_initial_admin(
+            database=database,
+            username="bootstrap-admin",
+            credentials_file=credentials_file,
+        )
+
+    assert not credentials_file.exists()
+    assert not pending_credentials_path(credentials_file).exists()
+
+
+def test_pending_credentials_repr_redacts_temporary_password():
+    import app.cloud.admin_cli as admin_cli
+
+    secret = "temporary-password-must-not-appear"
+    pending = admin_cli._PendingCredentials(
+        name=".credentials.pending",
+        username="bootstrap-admin",
+        temporary_password=secret,
+        descriptor=-1,
+        device=1,
+        inode=2,
+    )
+
+    assert secret not in repr(pending)
+    assert secret not in str(pending)
 
 
 def test_initial_admin_bootstrap_keeps_pending_when_commit_verification_errors(
@@ -1398,7 +1471,8 @@ def test_initial_admin_bootstrap_fsyncs_pending_then_commits_renames_and_fsyncs_
         credentials_file=credentials_file,
     )
 
-    assert events[:5] == [
+    pending_fsync_index = events.index("fsync-pending")
+    assert events[pending_fsync_index : pending_fsync_index + 5] == [
         "fsync-pending",
         "fsync-parent",
         "commit",
