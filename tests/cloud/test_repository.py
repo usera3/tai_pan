@@ -683,6 +683,69 @@ def test_automatic_download_claims_are_atomic_expirable_and_releasable(
     )
 
 
+def test_automatic_download_claim_renewal_extends_only_its_own_token(
+    repository: CloudRepository,
+    database: Database,
+):
+    user = create_user(repository, "claim-renewal-owner")
+    competing_repository = CloudRepository(
+        database,
+        KeyCipher(Fernet.generate_key()),
+    )
+    initial_expiry = NOW + timedelta(minutes=1)
+    renewed_expiry = NOW + timedelta(minutes=2)
+
+    assert repository.try_claim_automatic_download(
+        user.id,
+        ukey="SAME-UKEY",
+        claim_token="winner-token",
+        expires_at=initial_expiry,
+        now=NOW,
+    )
+    assert not competing_repository.renew_automatic_download_claim(
+        user.id,
+        ukey="SAME-UKEY",
+        claim_token="loser-token",
+        expires_at=renewed_expiry,
+        now=NOW + timedelta(seconds=30),
+    )
+    assert repository.renew_automatic_download_claim(
+        user.id,
+        ukey="SAME-UKEY",
+        claim_token="winner-token",
+        expires_at=renewed_expiry,
+        now=NOW + timedelta(seconds=30),
+    )
+    assert not competing_repository.try_claim_automatic_download(
+        user.id,
+        ukey="SAME-UKEY",
+        claim_token="loser-token",
+        expires_at=renewed_expiry + timedelta(minutes=1),
+        now=initial_expiry,
+    )
+    assert repository.try_claim_automatic_download(
+        user.id,
+        ukey="EXPIRED-UKEY",
+        claim_token="expired-token",
+        expires_at=initial_expiry,
+        now=NOW,
+    )
+    assert not repository.renew_automatic_download_claim(
+        user.id,
+        ukey="EXPIRED-UKEY",
+        claim_token="expired-token",
+        expires_at=renewed_expiry,
+        now=initial_expiry,
+    )
+    assert competing_repository.try_claim_automatic_download(
+        user.id,
+        ukey="EXPIRED-UKEY",
+        claim_token="replacement-token",
+        expires_at=renewed_expiry,
+        now=initial_expiry,
+    )
+
+
 def test_completing_a_claim_atomically_replaces_it_with_one_real_link(
     repository: CloudRepository,
     database: Database,

@@ -1012,6 +1012,34 @@ class CloudRepository:
             )
         return cursor.rowcount == 1
 
+    def renew_automatic_download_claim(
+        self,
+        user_id: str,
+        *,
+        ukey: str,
+        claim_token: str,
+        expires_at: datetime,
+        now: datetime | None = None,
+    ) -> bool:
+        serialized_now = _serialize_datetime(now or _now())
+        with closing(self._database.connection()) as connection, connection:
+            cursor = connection.execute(
+                """
+                UPDATE automatic_download_claims
+                SET expires_at = ?
+                WHERE user_id = ? AND ukey = ? AND claim_token = ?
+                  AND expires_at > ?
+                """,
+                (
+                    _serialize_datetime(expires_at),
+                    user_id,
+                    ukey,
+                    claim_token,
+                    serialized_now,
+                ),
+            )
+        return cursor.rowcount == 1
+
     def complete_automatic_download_claim(
         self,
         user_id: str,

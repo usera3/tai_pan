@@ -37,6 +37,23 @@ def _repository(request: Request) -> CloudRepository:
     return request.app.state.repository
 
 
+def _link_identity(item: Any) -> str | None:
+    if not isinstance(item, dict):
+        return None
+    for key in ("dkey", "direct_key"):
+        value = item.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _has_link_url(item: dict[str, Any]) -> bool:
+    return any(
+        isinstance(item.get(key), str) and item[key].strip()
+        for key in ("link", "url")
+    )
+
+
 def _normalize_links(data: Any, hidden_dkeys: set[str]) -> Any:
     wrapper_key = None
     items = data
@@ -50,11 +67,13 @@ def _normalize_links(data: Any, hidden_dkeys: set[str]) -> Any:
     if not isinstance(items, list):
         return data
 
-    normalized = [
-        with_tmp_source(item)
-        for item in items
-        if isinstance(item, dict) and item.get("dkey") not in hidden_dkeys
-    ]
+    normalized = []
+    for item in items:
+        dkey = _link_identity(item)
+        if dkey is None or not isinstance(item, dict) or not _has_link_url(item):
+            continue
+        if dkey not in hidden_dkeys:
+            normalized.append(with_tmp_source(item))
     if wrapper_key is None:
         return normalized
     return {**data, wrapper_key: normalized}

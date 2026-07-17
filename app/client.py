@@ -87,7 +87,7 @@ class TmpLinkClient:
         dkey = self._extract_dkey(data)
         if dkey:
             links = await self.list_links(page=1)
-            for link in links.data if isinstance(links.data, list) else []:
+            for link in self._link_items(links.data):
                 if isinstance(link, dict) and link.get("dkey") == dkey and link.get("link"):
                     return ServiceResult(ok=True, data=link, message=result.message)
 
@@ -218,3 +218,14 @@ class TmpLinkClient:
                 if isinstance(value, str) and value.strip():
                     return value.strip()
         return ""
+
+    @staticmethod
+    def _link_items(data: Any) -> list[Any]:
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            for key in ("data", "list"):
+                items = data.get(key)
+                if isinstance(items, list):
+                    return items
+        return []

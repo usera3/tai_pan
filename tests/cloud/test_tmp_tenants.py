@@ -630,6 +630,40 @@ def test_cloud_upload_enforces_exact_file_limit_normalizes_name_and_permissions(
     assert list(staging.iterdir()) == []
 
 
+@pytest.mark.parametrize(
+    ("filename", "expected"),
+    [
+        ("../../report.txt", "report.txt"),
+        ("C:\\private\\safe-测试.txt", "safe-测试.txt"),
+        ("unsafe\x00name\n.txt", "unsafe_name_.txt"),
+        ("", "upload.bin"),
+        (".", "upload.bin"),
+        ("..", "upload.bin"),
+    ],
+)
+def test_upload_basename_removes_path_components_and_control_characters(
+    filename: str, expected: str
+):
+    assert tmp_files_routes._upload_basename(filename) == expected
+
+
+def test_cloud_upload_forwards_the_sanitized_unicode_basename(
+    make_tenant, remote: RecordingRemote
+):
+    tenant = make_tenant("sanitized-upload", "sanitized-upload-key")
+
+    response = tenant.client.post(
+        "/api/uploads",
+        files={"file": ("C:\\private\\safe-测试.txt", b"content", "text/plain")},
+        headers=tenant.csrf_headers,
+    )
+
+    assert response.status_code == 200
+    assert remote.uploads == [
+        (tenant.key, "safe-测试.txt", 2, "text/plain", b"content")
+    ]
+
+
 def test_upload_remote_failure_cleans_staging(
     config: CloudConfig,
     make_tenant,
@@ -808,6 +842,71 @@ async def test_concurrent_downloads_across_app_instances_create_one_remote_link(
         ).fetchone()[0]
     assert real_rows == 1
     assert claims == 0
+
+
+@pytest.mark.asyncio
+async def test_download_claim_heartbeat_keeps_cross_instance_waiters_from_creating_duplicates(
+    cloud_app,
+    config: CloudConfig,
+    database: Database,
+    make_tenant,
+    remote: RecordingRemote,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    tenant = make_tenant("heartbeat-download", "heartbeat-download-key")
+    second_application = create_cloud_app(config, Database(database.path))
+    second_application.state.tmp_client_factory = remote.factory
+    monkeypatch.setattr(
+        tmp_files_routes, "DOWNLOAD_CLAIM_LIFETIME", timedelta(seconds=1)
+    )
+    monkeypatch.setattr(
+        tmp_files_routes, "DOWNLOAD_CLAIM_RENEW_SECONDS", 0.1, raising=False
+    )
+    monkeypatch.setattr(tmp_files_routes, "DOWNLOAD_CLAIM_WAIT_SECONDS", 3.0)
+    monkeypatch.setattr(tmp_files_routes, "DOWNLOAD_CLAIM_POLL_SECONDS", 0.02)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    remote.download_started[tenant.key] = started
+    remote.download_release[tenant.key] = release
+    headers = {
+        **tenant.csrf_headers,
+        "Cookie": "session=session-heartbeat-download",
+    }
+
+    async with (
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=cloud_app),
+            base_url=PUBLIC_ORIGIN,
+        ) as first_client,
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=second_application),
+            base_url=PUBLIC_ORIGIN,
+        ) as second_client,
+    ):
+        first_pending = asyncio.create_task(
+            first_client.post("/api/files/SAME-UKEY/download", headers=headers)
+        )
+        await asyncio.wait_for(started.wait(), timeout=2)
+        await asyncio.sleep(1.2)
+        second_pending = asyncio.create_task(
+            second_client.post("/api/files/SAME-UKEY/download", headers=headers)
+        )
+        await asyncio.sleep(0.2)
+        creates = [
+            call
+            for call in remote.calls
+            if call[:3] == (tenant.key, "create_download_link", "SAME-UKEY")
+        ]
+        assert len(creates) == 1
+        release.set()
+        first_response, second_response = await asyncio.gather(
+            first_pending,
+            second_pending,
+        )
+
+    assert first_response.status_code == 200
+    assert second_response.status_code == 200
+    assert first_response.json()["data"] == second_response.json()["data"]
 
 
 @pytest.mark.asyncio
@@ -995,6 +1094,45 @@ def test_wrapped_remote_links_filter_actual_items_and_preserve_wrapper_metadata(
         "total": 4,
     }
     assert "source" not in wrapper
+
+
+@pytest.mark.parametrize("items_key", [None, "data", "list"])
+def test_link_listing_drops_malformed_items_and_keeps_valid_aliases(
+    items_key: str | None,
+    cloud_app,
+    make_tenant,
+    remote: RecordingRemote,
+):
+    tenant = make_tenant(f"malformed-links-{items_key}", f"malformed-links-key-{items_key}")
+    items = [
+        {},
+        {"dkey": "", "link": "https://tmp/empty-key"},
+        {"dkey": [], "link": "https://tmp/unhashable-key"},
+        {"dkey": "NONSTRING", "link": ""},
+        {"dkey": "NONSTRING", "link": []},
+        {"dkey": "VALID-DKEY", "link": "https://tmp/valid"},
+        {"direct_key": "VALID-DIRECT", "url": "https://tmp/direct"},
+    ]
+    remote.links[tenant.key] = (
+        items if items_key is None else {items_key: items, "page": 2, "total": len(items)}
+    )
+
+    response = tenant.client.get("/api/links?page=2")
+
+    assert response.status_code == 200
+    data = response.json()["data"]
+    visible = data if items_key is None else data[items_key]
+    assert visible == [
+        {"dkey": "VALID-DKEY", "link": "https://tmp/valid", "source": "tmp"},
+        {
+            "direct_key": "VALID-DIRECT",
+            "url": "https://tmp/direct",
+            "source": "tmp",
+        },
+    ]
+    if items_key is not None:
+        assert data["page"] == 2
+        assert data["total"] == len(items)
 
 
 def test_manual_links_stay_visible_and_cross_tenant_deletes_do_not_remove_auto_rows(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import tempfile
+from contextlib import suppress
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated, Any
@@ -40,6 +41,7 @@ IdentifierPath = Annotated[
 UPLOAD_CHUNK_BYTES = 1024 * 1024
 TMP_STORAGE_MODELS = {0, 1, 2}
 DOWNLOAD_CLAIM_LIFETIME = timedelta(seconds=45)
+DOWNLOAD_CLAIM_RENEW_SECONDS = 15.0
 DOWNLOAD_CLAIM_WAIT_SECONDS = 50.0
 DOWNLOAD_CLAIM_POLL_SECONDS = 0.05
 
@@ -62,6 +64,34 @@ def _download_data(data: Any) -> tuple[str, str] | None:
     if not dkey.strip() or not link.strip():
         return None
     return dkey.strip(), link.strip()
+
+
+def _upload_basename(filename: str | None) -> str:
+    basename = (filename or "").replace("\\", "/").rsplit("/", 1)[-1]
+    basename = "".join(
+        "_" if ord(character) < 32 or ord(character) == 127 else character
+        for character in basename
+    )
+    return basename if basename not in {"", ".", ".."} else "upload.bin"
+
+
+async def _renew_download_claim(
+    repository: CloudRepository,
+    user_id: str,
+    ukey: str,
+    claim_token: str,
+) -> None:
+    while True:
+        await asyncio.sleep(DOWNLOAD_CLAIM_RENEW_SECONDS)
+        now = datetime.now(timezone.utc)
+        if not repository.renew_automatic_download_claim(
+            user_id,
+            ukey=ukey,
+            claim_token=claim_token,
+            expires_at=now + DOWNLOAD_CLAIM_LIFETIME,
+            now=now,
+        ):
+            return
 
 
 def _invalid_upload() -> HTTPException:
@@ -173,8 +203,7 @@ async def upload(
             request,
             user,
             lambda client: client.upload_file(
-                Path((file.filename or "upload.bin").replace("\\", "/")).name
-                or "upload.bin",
+                _upload_basename(file.filename),
                 staged,
                 model,
                 file.content_type or "application/octet-stream",
@@ -210,6 +239,9 @@ async def download_file(
             now=now,
         )
         if claimed:
+            heartbeat = asyncio.create_task(
+                _renew_download_claim(repository, user.id, ukey, claim_token)
+            )
             try:
                 result = await call_tmp(
                     request,
@@ -247,6 +279,10 @@ async def download_file(
                     claim_token=claim_token,
                 )
                 raise
+            finally:
+                heartbeat.cancel()
+                with suppress(asyncio.CancelledError):
+                    await heartbeat
 
         if asyncio.get_running_loop().time() >= wait_deadline:
             raise HTTPException(

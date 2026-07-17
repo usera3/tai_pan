@@ -233,6 +233,26 @@ async def test_download_link_is_valid_for_one_day_without_download_limit():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("items_key", [None, "data", "list"])
+async def test_download_link_fallback_finds_a_created_link_in_list_wrappers(items_key):
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        if len(captured) == 1:
+            return httpx.Response(200, json={"status": 1, "data": {"dkey": "D1"}})
+        items = [{"dkey": "D1", "link": "https://files.example/D1"}]
+        data = items if items_key is None else {items_key: items, "page": 1}
+        return httpx.Response(200, json={"status": 1, "data": data})
+
+    client = TmpLinkClient("test-key", transport=httpx.MockTransport(handler))
+
+    result = await client.create_download_link("FILE-UKEY")
+
+    assert result.data == {"dkey": "D1", "link": "https://files.example/D1"}
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "created_data",
     ["D1", {"dkey": "D1"}, {"direct_key": "D1"}, [{"dkey": "D1"}]],
