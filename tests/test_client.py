@@ -1,3 +1,4 @@
+from io import BytesIO
 from urllib.parse import parse_qs
 
 import httpx
@@ -102,6 +103,41 @@ async def test_upload_uses_documented_multipart_fields():
     assert b'name="model"' in body and b"99" in body
     assert b'filename="report.txt"' in body and b"hello" in body
     assert result.data == "UPLOADED-UKEY"
+
+
+@pytest.mark.asyncio
+async def test_upload_file_streams_a_file_object_in_bounded_reads():
+    class BoundedReadFile(BytesIO):
+        def __init__(self, content: bytes):
+            super().__init__(content)
+            self.read_sizes: list[int] = []
+
+        def read(self, size: int = -1) -> bytes:
+            self.read_sizes.append(size)
+            if size < 0:
+                raise AssertionError("stream must not be read without a bound")
+            return super().read(size)
+
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(200, json={"status": 1, "data": "STREAMED-UKEY"})
+
+    source = BoundedReadFile(b"streamed-content")
+    client = TmpLinkClient("stream-key", transport=httpx.MockTransport(handler))
+
+    result = await client.upload_file(
+        "report.txt",
+        source,
+        model=2,
+        content_type="text/plain",
+    )
+
+    assert b'streamed-content' in captured[0].content
+    assert source.read_sizes
+    assert all(size > 0 for size in source.read_sizes)
+    assert result.data == "STREAMED-UKEY"
 
 
 @pytest.mark.asyncio
@@ -234,6 +270,43 @@ async def test_business_error_is_descriptive_and_redacted():
         await client.quota()
 
     assert "test-key" not in str(error.value)
+
+
+@pytest.mark.asyncio
+async def test_business_error_ignores_a_remote_message_that_echoes_the_key():
+    api_key = "key-that-the-remote-must-not-echo"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"status": 6, "message": f"invalid credential: {api_key}"},
+        )
+
+    client = TmpLinkClient(api_key, transport=httpx.MockTransport(handler))
+
+    with pytest.raises(TmpLinkBusinessError) as captured:
+        await client.quota()
+
+    rendered = f"{captured.value!r} {captured.value} {client!r}"
+    assert api_key not in rendered
+
+
+@pytest.mark.asyncio
+async def test_success_response_does_not_preserve_a_remote_message():
+    api_key = "key-that-the-remote-must-not-echo"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"status": 1, "data": {"ok": True}, "message": api_key},
+        )
+
+    client = TmpLinkClient(api_key, transport=httpx.MockTransport(handler))
+
+    result = await client.quota()
+
+    assert result.message == ""
+    assert api_key not in repr(result)
 
 
 @pytest.mark.asyncio

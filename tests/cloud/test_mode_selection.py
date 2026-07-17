@@ -75,7 +75,7 @@ def test_cloud_import_constructs_cloud_application_with_complete_config(tmp_path
     assert details["mode"] == "cloud"
     assert details["title"] == "TMP Link Manager Cloud"
     assert "/api/auth/login" in details["routes"]
-    assert "/api/settings" not in details["routes"]
+    assert "/api/settings" in details["routes"]
     assert (tmp_path / "cloud.db").exists()
 
 

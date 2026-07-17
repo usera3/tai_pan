@@ -6,10 +6,17 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
+from app.client import TmpLinkClient
 from app.cloud.config import CloudConfig
 from app.cloud.db import Database
 from app.cloud.repository import CloudRepository
-from app.cloud.routes import admin_router, auth_router
+from app.cloud.routes import (
+    admin_router,
+    auth_router,
+    links_router,
+    settings_router,
+    tmp_files_router,
+)
 from app.cloud.routes.auth import REGISTRATION_LIMIT, REGISTRATION_WINDOW
 from app.cloud.security import KeyCipher, PasswordService, TokenService
 
@@ -47,6 +54,7 @@ def create_cloud_app(config: CloudConfig, database: Database) -> FastAPI:
     application.state.config = config
     application.state.database = database
     application.state.repository = repository
+    application.state.tmp_client_factory = TmpLinkClient
     application.state.password_service = password_service
     application.state.token_service = token_service
     application.state.dummy_password_hash = password_service.hash(
@@ -94,4 +102,7 @@ def create_cloud_app(config: CloudConfig, database: Database) -> FastAPI:
 
     application.include_router(auth_router)
     application.include_router(admin_router)
+    application.include_router(settings_router)
+    application.include_router(tmp_files_router)
+    application.include_router(links_router)
     return application

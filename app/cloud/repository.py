@@ -987,7 +987,7 @@ class CloudRepository:
             clauses.append("ukey = ?")
             parameters.append(ukey)
         if active_at is not None:
-            clauses.append("(expires_at IS NULL OR expires_at > ?)")
+            clauses.append("(expires_at IS NULL OR expires_at >= ?)")
             parameters.append(_serialize_datetime(active_at))
         query = (
             "SELECT * FROM automatic_download_links WHERE "
@@ -1008,6 +1008,17 @@ class CloudRepository:
                 (user_id, dkey),
             )
         return cursor.rowcount == 1
+
+    def delete_automatic_download_links(self, user_id: str, *, ukey: str) -> int:
+        with closing(self._database.connection()) as connection, connection:
+            cursor = connection.execute(
+                """
+                DELETE FROM automatic_download_links
+                WHERE user_id = ? AND ukey = ?
+                """,
+                (user_id, ukey),
+            )
+        return cursor.rowcount
 
     def create_audit_event(
         self,
