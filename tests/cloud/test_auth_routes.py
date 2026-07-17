@@ -195,6 +195,31 @@ def test_registration_is_limited_to_ten_submissions_per_ip(
     assert responses[10].status_code == 429
 
 
+def test_registration_submissions_do_not_throttle_login_for_same_ip(
+    cloud_app, client: TestClient
+):
+    password = "registration-isolated-login-password"
+    create_user(cloud_app, "registration-isolated-user", password=password)
+
+    responses = [
+        register(
+            client,
+            username=f"invalid-registration-{index}",
+            invitation_code=f"missing-invitation-{index}",
+        )
+        for index in range(5)
+    ]
+
+    assert [response.status_code for response in responses] == [400] * 5
+    authenticated = login(
+        client,
+        username="registration-isolated-user",
+        password=password,
+    )
+
+    assert authenticated.status_code == 200
+
+
 def test_registration_counts_invalid_json_and_fields_before_body_parsing(
     cloud_app, client: TestClient
 ):

@@ -546,3 +546,52 @@ def test_auth_attempts_record_invalid_login_identifiers_for_ip_rate_limiting(
     assert repository.count_failed_auth_attempts(
         since=NOW - timedelta(minutes=15), remote_addr=remote_addr
     ) == 1
+
+
+def test_login_ip_rate_limit_ignores_registration_attempts(
+    repository: CloudRepository,
+):
+    remote_addr = "203.0.113.78"
+    since = NOW - timedelta(minutes=15)
+
+    for index in range(5):
+        assert repository.claim_registration_submission(
+            remote_addr=remote_addr,
+            since=since,
+            limit=10,
+            now=NOW + timedelta(seconds=index),
+        )
+
+    assert repository.count_registration_attempts(
+        since=since, remote_addr=remote_addr
+    ) == 5
+    assert repository.count_failed_auth_attempts(
+        since=since, remote_addr=remote_addr
+    ) == 0
+    assert repository.claim_failed_login_attempt(
+        username="login-user",
+        remote_addr=remote_addr,
+        since=since,
+        limit=5,
+        now=NOW + timedelta(seconds=5),
+    )
+
+    for index in range(4):
+        assert repository.claim_failed_login_attempt(
+            username=f"login-user-{index}",
+            remote_addr=remote_addr,
+            since=since,
+            limit=5,
+            now=NOW + timedelta(seconds=index + 6),
+        )
+
+    assert not repository.claim_failed_login_attempt(
+        username="login-user-final",
+        remote_addr=remote_addr,
+        since=since,
+        limit=5,
+        now=NOW + timedelta(seconds=10),
+    )
+    assert repository.count_failed_auth_attempts(
+        since=since, remote_addr=remote_addr
+    ) == 5

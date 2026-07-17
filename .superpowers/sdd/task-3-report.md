@@ -45,7 +45,12 @@ $ .venv/bin/python -m pytest -q tests/test_routes.py tests/cloud/test_repository
 12 passed, 15 deselected in 5.58s
 ```
 
-Whitespace verification:
+Historical whitespace verification (corrected):
+
+The first authentication commit, `38af72d`, was later found by the controller
+to contain an EOF blank line in `tests/cloud/test_auth_routes.py`. The follow-up
+fix commit, `a87eb42`, removed that blank line; only then was the tree actually
+clean under `git diff --check`.
 
 ```text
 $ git diff --check
@@ -175,3 +180,30 @@ Per the controller's stop instruction, no additional pytest command was started.
   in this remediation run because the controller explicitly stopped expansion.
 - Trusted proxy handling remains deferred to Task 8; this change intentionally
   continues to use `request.client.host`.
+
+## Authentication Rate-Limit Isolation Follow-up (2026-07-17)
+
+### RED
+
+Focused regressions were added before changing the repository SQL:
+
+```text
+$ .venv/bin/python -m pytest -q tests/cloud/test_auth_routes.py tests/cloud/test_repository.py -k 'registration_submissions_do_not_throttle_login_for_same_ip or login_ip_rate_limit_ignores_registration_attempts'
+FF                                                                       [100%]
+2 failed, 45 deselected in 8.60s
+```
+
+The route regression received `429` instead of allowing valid login after five
+invalid registration submissions from the same IP. The repository regression
+counted those five `username IS NULL` registration records as login failures.
+
+### GREEN
+
+The focused command passed after adding `username IS NOT NULL` to the login IP
+failure count and atomic claim queries:
+
+```text
+$ .venv/bin/python -m pytest -q tests/cloud/test_auth_routes.py tests/cloud/test_repository.py -k 'registration_submissions_do_not_throttle_login_for_same_ip or login_ip_rate_limit_ignores_registration_attempts'
+..                                                                       [100%]
+2 passed, 45 deselected in 7.41s
+```

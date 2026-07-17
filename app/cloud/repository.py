@@ -978,7 +978,8 @@ class CloudRepository:
                 ip_count = connection.execute(
                     """
                     SELECT COUNT(*) FROM auth_attempts
-                    WHERE successful = 0 AND remote_addr = ? AND created_at >= ?
+                    WHERE successful = 0 AND username IS NOT NULL
+                      AND remote_addr = ? AND created_at >= ?
                     """,
                     (remote_addr, serialized_since),
                 ).fetchone()[0]
@@ -1057,6 +1058,7 @@ class CloudRepository:
             clauses.append("username = ?")
             parameters.append(_normalize_auth_identifier(username))
         if remote_addr is not None:
+            clauses.append("username IS NOT NULL")
             clauses.append("remote_addr = ?")
             parameters.append(remote_addr)
         query = "SELECT COUNT(*) FROM auth_attempts WHERE " + " AND ".join(clauses)
