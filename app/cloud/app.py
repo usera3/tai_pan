@@ -21,6 +21,7 @@ from app.cloud.routes import (
 )
 from app.cloud.routes.auth import REGISTRATION_LIMIT, REGISTRATION_WINDOW
 from app.cloud.security import KeyCipher, PasswordService, TokenService
+from app.cloud.storage import CloudStorage
 
 
 UPLOAD_MULTIPART_OVERHEAD_BYTES = 64 * 1024
@@ -171,6 +172,14 @@ def create_cloud_app(config: CloudConfig, database: Database) -> FastAPI:
     application.state.config = config
     application.state.database = database
     application.state.repository = repository
+    application.state.cloud_storage = CloudStorage(
+        config.storage_path,
+        repository,
+        max_file_bytes=config.max_file_bytes,
+        user_quota_bytes=config.user_quota_bytes,
+        global_quota_bytes=config.global_quota_bytes,
+        min_free_bytes=config.min_free_bytes,
+    )
     application.state.tmp_client_factory = TmpLinkClient
     application.state.password_service = password_service
     application.state.token_service = token_service

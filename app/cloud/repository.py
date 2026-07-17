@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
+from collections.abc import Callable
 from contextlib import closing
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -883,6 +884,73 @@ class CloudRepository:
             ).fetchone()
         return _cloud_file_from_row(row)
 
+    def finalize_cloud_file(
+        self,
+        user_id: str,
+        *,
+        file_id: str,
+        original_name: str,
+        content_type: str,
+        size_bytes: int,
+        storage_path: str,
+        sha256: str,
+        validate_quota: Callable[[int, int], None],
+        finalize: Callable[[], None],
+        now: datetime | None = None,
+    ) -> CloudFile:
+        """Validate quotas and register one finalized file under a write lock."""
+        connection = self._database.connection()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            user_total = int(
+                connection.execute(
+                    """
+                    SELECT COALESCE(SUM(size_bytes), 0)
+                    FROM cloud_files WHERE user_id = ?
+                    """,
+                    (user_id,),
+                ).fetchone()[0]
+            )
+            global_total = int(
+                connection.execute(
+                    "SELECT COALESCE(SUM(size_bytes), 0) FROM cloud_files"
+                ).fetchone()[0]
+            )
+            validate_quota(user_total, global_total)
+            finalize()
+            connection.execute(
+                """
+                INSERT INTO cloud_files (
+                    id, user_id, original_name, content_type, size_bytes,
+                    storage_path, sha256, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    file_id,
+                    user_id,
+                    original_name,
+                    content_type,
+                    size_bytes,
+                    storage_path,
+                    sha256,
+                    _serialize_datetime(now or _now()),
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM cloud_files WHERE id = ? AND user_id = ?",
+                (file_id, user_id),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("cloud file insert could not be read back")
+            result = _cloud_file_from_row(row)
+            connection.commit()
+            return result
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
     def get_cloud_file(self, user_id: str, file_id: str) -> CloudFile | None:
         with closing(self._database.connection()) as connection:
             row = connection.execute(
@@ -909,6 +977,54 @@ class CloudRepository:
                 (file_id, user_id),
             )
         return cursor.rowcount == 1
+
+    def delete_cloud_file_with_audit(
+        self,
+        user_id: str,
+        file_id: str,
+        *,
+        stage_delete: Callable[[CloudFile], None],
+        now: datetime | None = None,
+    ) -> CloudFile | None:
+        """Serialize ownership, disk staging, metadata deletion, and audit."""
+        connection = self._database.connection()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM cloud_files WHERE id = ? AND user_id = ?",
+                (file_id, user_id),
+            ).fetchone()
+            if row is None:
+                connection.rollback()
+                return None
+            cloud_file = _cloud_file_from_row(row)
+            stage_delete(cloud_file)
+            connection.execute(
+                "DELETE FROM cloud_files WHERE id = ? AND user_id = ?",
+                (file_id, user_id),
+            )
+            connection.execute(
+                """
+                INSERT INTO audit_events (
+                    id, user_id, event_type, target_type, target_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(uuid4()),
+                    user_id,
+                    "cloud_file_deleted",
+                    "cloud_file",
+                    file_id,
+                    _serialize_datetime(now or _now()),
+                ),
+            )
+            connection.commit()
+            return cloud_file
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
     def user_storage_bytes(self, user_id: str) -> int:
         with closing(self._database.connection()) as connection:

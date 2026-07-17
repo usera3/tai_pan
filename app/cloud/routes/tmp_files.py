@@ -5,7 +5,7 @@ import tempfile
 from contextlib import suppress
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 from uuid import uuid4
 
 from fastapi import (
@@ -23,6 +23,12 @@ from fastapi import (
 
 from app.cloud.dependencies import active_user
 from app.cloud.repository import CloudRepository, User
+from app.cloud.routes.cloud_files import (
+    delete_cloud_file,
+    download_cloud_file,
+    list_cloud_file_data,
+    upload_cloud_file,
+)
 from app.cloud.tmp_service import (
     TMP_REQUEST_FAILED,
     active_user_with_csrf,
@@ -142,6 +148,19 @@ def _download_response(link) -> dict[str, Any]:
     )
 
 
+def _flat_tmp_file_data(data: Any) -> list[dict[str, Any]]:
+    items = data
+    if isinstance(data, dict):
+        items = data.get("data", data.get("list", []))
+    if not isinstance(items, list):
+        return []
+    return [
+        with_tmp_source(item)
+        for item in items
+        if isinstance(item, dict)
+    ]
+
+
 @router.get("/quota")
 async def quota(
     request: Request,
@@ -156,13 +175,29 @@ async def quota(
 async def files(
     request: Request,
     page: int = Query(default=1, ge=1),
+    source: Literal["tmp", "cloud", "all"] = Query(default="tmp"),
     user: User = Depends(active_user),
 ) -> dict[str, Any]:
+    if source == "cloud":
+        return {
+            "ok": True,
+            "data": list_cloud_file_data(request, user),
+            "message": "",
+        }
+    if source == "all":
+        cloud_data = list_cloud_file_data(request, user)
+        if _repository(request).get_tmp_key(user.id) is None:
+            return {"ok": True, "data": cloud_data, "message": ""}
     result = await call_tmp(
         request,
         user,
         lambda client: client.list_files(page),
     )
+    if source == "all":
+        return result_envelope(
+            result,
+            data=[*_flat_tmp_file_data(result.data), *cloud_data],
+        )
     return result_envelope(result, data=with_tmp_source(result.data))
 
 
@@ -171,8 +206,11 @@ async def upload(
     request: Request,
     file: UploadFile = File(...),
     model: int = Form(default=2),
+    storage: Literal["tmp", "cloud"] = Form(default="tmp"),
     user: User = Depends(active_user_with_csrf),
 ) -> dict[str, Any]:
+    if storage == "cloud":
+        return await upload_cloud_file(request, user, file)
     if model not in TMP_STORAGE_MODELS:
         raise _invalid_upload()
 
@@ -219,8 +257,11 @@ async def upload(
 async def download_file(
     ukey: IdentifierPath,
     request: Request,
+    source: Literal["tmp", "cloud"] = Query(default="tmp"),
     user: User = Depends(active_user_with_csrf),
-) -> dict[str, Any]:
+) -> Any:
+    if source == "cloud":
+        return download_cloud_file(request, user, ukey)
     repository = _repository(request)
     claim_token = str(uuid4())
     wait_deadline = asyncio.get_running_loop().time() + DOWNLOAD_CLAIM_WAIT_SECONDS
@@ -296,8 +337,11 @@ async def download_file(
 async def delete_file(
     ukey: IdentifierPath,
     request: Request,
+    source: Literal["tmp", "cloud"] = Query(default="tmp"),
     user: User = Depends(active_user_with_csrf),
 ) -> dict[str, Any]:
+    if source == "cloud":
+        return delete_cloud_file(request, user, ukey)
     result = await call_tmp(
         request,
         user,
