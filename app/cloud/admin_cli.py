@@ -9,7 +9,6 @@ import os
 import secrets
 import stat
 import sys
-from contextlib import closing
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -88,7 +87,7 @@ def _open_credentials_directory(path: Path) -> int:
     if (
         not stat.S_ISDIR(metadata.st_mode)
         or metadata.st_uid != os.geteuid()
-        or mode & 0o022
+        or mode & 0o077
     ):
         os.close(descriptor)
         raise BootstrapError("Credentials directory is not safe")
@@ -127,6 +126,13 @@ def _acquire_bootstrap_lock(directory_fd: int, name: str) -> _BootstrapLock:
         ):
             raise BootstrapError("Bootstrap lock is not safe")
         fcntl.flock(descriptor, fcntl.LOCK_EX)
+        named_metadata = _entry_metadata(directory_fd, name)
+        if (
+            named_metadata is None
+            or named_metadata.st_dev != metadata.st_dev
+            or named_metadata.st_ino != metadata.st_ino
+        ):
+            raise BootstrapError("Bootstrap lock changed while acquiring it")
         os.fsync(directory_fd)
         return _BootstrapLock(descriptor)
     except BaseException:
@@ -139,6 +145,7 @@ def _validate_pending_metadata(metadata: os.stat_result) -> None:
         not stat.S_ISREG(metadata.st_mode)
         or stat.S_IMODE(metadata.st_mode) != 0o600
         or metadata.st_uid != os.geteuid()
+        or metadata.st_nlink != 1
     ):
         raise BootstrapError("Pending credentials are not safe")
 
@@ -319,10 +326,13 @@ def _rename_pending_credentials(
 
 
 def _find_admin(database: Database):
-    with closing(database.connection()) as connection:
+    connection = database.connection()
+    try:
         return connection.execute(
             "SELECT * FROM users WHERE role = 'admin' ORDER BY created_at LIMIT 1"
         ).fetchone()
+    finally:
+        _close_quietly(connection)
 
 
 def _matching_admin(
@@ -384,6 +394,8 @@ def bootstrap_initial_admin(
         database.initialize()
         final_name = credential_path.name
         pending_name = _pending_name(final_name)
+        if _entry_exists(directory_fd, f"{pending_name}.pin"):
+            raise BootstrapError("Legacy pending credentials require manual recovery")
 
         if _entry_exists(directory_fd, final_name):
             raise BootstrapError("Initial administrator could not be created")

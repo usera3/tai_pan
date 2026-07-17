@@ -74,6 +74,10 @@ def pending_credentials_path(credentials_file: Path) -> Path:
     return credentials_file.with_name(f".{credentials_file.name}.pending")
 
 
+def legacy_pin_path(credentials_file: Path) -> Path:
+    return credentials_file.with_name(f".{credentials_file.name}.pending.pin")
+
+
 def write_pending_credentials(
     credentials_file: Path,
     *,
@@ -1267,6 +1271,140 @@ def test_initial_admin_bootstrap_serializes_concurrent_invocations(
     )
 
 
+def test_initial_admin_bootstrap_serializes_independent_processes(tmp_path: Path):
+    database_path = tmp_path / "process-bootstrap.db"
+    credentials_file = tmp_path / "process-bootstrap.json"
+    command = [
+        sys.executable,
+        "-m",
+        "app.cloud.admin_cli",
+        "--database-path",
+        str(database_path),
+        "--username",
+        "bootstrap-admin",
+        "--credentials-file",
+        str(credentials_file),
+    ]
+
+    processes = [
+        subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        for _ in range(2)
+    ]
+    results = [process.communicate(timeout=30) + (process.returncode,) for process in processes]
+
+    assert [result[2] for result in results].count(0) == 1
+    assert [result[2] for result in results].count(1) == 1
+    credentials = json.loads(credentials_file.read_text(encoding="utf-8"))
+    assert all(credentials["temporary_password"] not in result[0] for result in results)
+    assert all(credentials["temporary_password"] not in result[1] for result in results)
+    with Database(database_path).connection() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM users WHERE role = 'admin'"
+        ).fetchone()[0] == 1
+
+
+@pytest.mark.parametrize("legacy_state", ["anchor-only", "pending-and-anchor"])
+def test_initial_admin_bootstrap_refuses_legacy_anchor_state(
+    tmp_path: Path, legacy_state: str
+):
+    from app.cloud.admin_cli import BootstrapError, bootstrap_initial_admin
+
+    database = Database(tmp_path / "legacy-anchor.db")
+    credentials_file = tmp_path / "legacy-anchor.json"
+    pending_path = pending_credentials_path(credentials_file)
+    pin_path = legacy_pin_path(credentials_file)
+    if legacy_state == "anchor-only":
+        pin_path.write_text("legacy secret state", encoding="utf-8")
+        pin_path.chmod(0o600)
+    else:
+        write_pending_credentials(
+            credentials_file,
+            username="bootstrap-admin",
+            temporary_password="legacy-anchor-password",
+        )
+        os.link(pending_path, pin_path)
+
+    with pytest.raises(BootstrapError):
+        bootstrap_initial_admin(
+            database=database,
+            username="bootstrap-admin",
+            credentials_file=credentials_file,
+        )
+
+    assert not credentials_file.exists()
+    assert pin_path.exists()
+
+
+@pytest.mark.parametrize("entry_type", ["regular", "symlink"])
+def test_initial_admin_bootstrap_validates_existing_lock_entry(
+    tmp_path: Path, entry_type: str
+):
+    from app.cloud.admin_cli import BootstrapError, bootstrap_initial_admin
+
+    database = Database(tmp_path / "lock-entry.db")
+    credentials_file = tmp_path / "lock-entry.json"
+    lock_path = credentials_file.with_name(f".{credentials_file.name}.lock")
+    if entry_type == "regular":
+        lock_path.touch(mode=0o600)
+        lock_path.chmod(0o600)
+        user_id = bootstrap_initial_admin(
+            database=database,
+            username="bootstrap-admin",
+            credentials_file=credentials_file,
+        )
+        assert user_id
+        assert stat.S_IMODE(lock_path.stat().st_mode) == 0o600
+    else:
+        target = tmp_path / "lock-target"
+        target.touch(mode=0o600)
+        lock_path.symlink_to(target)
+        with pytest.raises(BootstrapError):
+            bootstrap_initial_admin(
+                database=database,
+                username="bootstrap-admin",
+                credentials_file=credentials_file,
+            )
+        assert not credentials_file.exists()
+
+
+def test_initial_admin_bootstrap_rejects_lock_inode_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    import app.cloud.admin_cli as admin_cli
+
+    database = Database(tmp_path / "lock-replacement.db")
+    credentials_file = tmp_path / "lock-replacement.json"
+    lock_path = credentials_file.with_name(f".{credentials_file.name}.lock")
+    original_flock = admin_cli.fcntl.flock
+    replaced = False
+
+    def replace_after_lock(descriptor: int, operation: int):
+        nonlocal replaced
+        result = original_flock(descriptor, operation)
+        if operation == admin_cli.fcntl.LOCK_EX and not replaced:
+            replaced = True
+            lock_path.unlink()
+            lock_path.touch(mode=0o600)
+            lock_path.chmod(0o600)
+        return result
+
+    monkeypatch.setattr(admin_cli.fcntl, "flock", replace_after_lock)
+
+    with pytest.raises(admin_cli.BootstrapError):
+        admin_cli.bootstrap_initial_admin(
+            database=database,
+            username="bootstrap-admin",
+            credentials_file=credentials_file,
+        )
+
+    assert not credentials_file.exists()
+    database.initialize()
+    with database.connection() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM users WHERE role = 'admin'"
+        ).fetchone()[0] == 0
+
+
 def test_initial_admin_bootstrap_cleans_interrupted_pending_write(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -1285,6 +1423,30 @@ def test_initial_admin_bootstrap_cleans_interrupted_pending_write(
         return original_fsync(descriptor)
 
     monkeypatch.setattr(admin_cli.os, "fsync", interrupt_file_fsync)
+
+    with pytest.raises(KeyboardInterrupt):
+        admin_cli.bootstrap_initial_admin(
+            database=database,
+            username="bootstrap-admin",
+            credentials_file=credentials_file,
+        )
+
+    assert not credentials_file.exists()
+    assert not pending_credentials_path(credentials_file).exists()
+
+
+def test_initial_admin_bootstrap_cleans_interrupted_os_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    import app.cloud.admin_cli as admin_cli
+
+    database = Database(tmp_path / "bootstrap.db")
+    credentials_file = tmp_path / "interrupted-os-write.json"
+    monkeypatch.setattr(
+        admin_cli.os,
+        "write",
+        lambda *args, **kwargs: (_ for _ in ()).throw(KeyboardInterrupt()),
+    )
 
     with pytest.raises(KeyboardInterrupt):
         admin_cli.bootstrap_initial_admin(
@@ -1352,6 +1514,59 @@ def test_pending_credentials_repr_redacts_temporary_password():
 
     assert secret not in repr(pending)
     assert secret not in str(pending)
+
+
+def test_initial_admin_bootstrap_survives_resource_close_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    import app.cloud.admin_cli as admin_cli
+
+    database = Database(tmp_path / "close-errors.db")
+    database.initialize()
+    monkeypatch.setattr(database, "initialize", lambda: None)
+    credentials_file = tmp_path / "close-errors.json"
+    original_connection = database.connection
+    original_pending_close = admin_cli._PendingCredentials.close
+
+    class CloseFailConnection:
+        def __init__(self):
+            self._connection = original_connection()
+
+        def close(self):
+            self._connection.close()
+            raise OSError("injected connection close failure")
+
+        def commit(self):
+            self._connection.commit()
+
+        def rollback(self):
+            self._connection.rollback()
+
+        def execute(self, query: str, parameters=()):
+            return self._connection.execute(query, parameters)
+
+    def close_pending_then_fail(pending):
+        original_pending_close(pending)
+        raise OSError("injected pending close failure")
+
+    monkeypatch.setattr(database, "connection", CloseFailConnection)
+    monkeypatch.setattr(
+        admin_cli._PendingCredentials,
+        "close",
+        close_pending_then_fail,
+    )
+
+    user_id = admin_cli.bootstrap_initial_admin(
+        database=database,
+        username="bootstrap-admin",
+        credentials_file=credentials_file,
+    )
+
+    assert user_id
+    assert credentials_file.exists()
+    assert json.loads(credentials_file.read_text(encoding="utf-8"))["username"] == (
+        "bootstrap-admin"
+    )
 
 
 def test_initial_admin_bootstrap_keeps_pending_when_commit_verification_errors(
