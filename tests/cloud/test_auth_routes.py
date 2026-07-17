@@ -381,6 +381,33 @@ def test_me_recovers_stable_csrf_token_that_authorizes_logout(cloud_app, client)
     assert logged_out.status_code == 200
 
 
+def test_legacy_random_stored_csrf_remains_valid_while_me_recovers_derived_token(
+    cloud_app, client
+):
+    user = create_user(cloud_app, "legacy-csrf-user")
+    session_token = "legacy-csrf-session-token"
+    legacy_token = "legacy-random-csrf-token"
+    cloud_app.state.repository.create_session(
+        user.id,
+        token=session_token,
+        csrf_token=legacy_token,
+        expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+    )
+    client.cookies.set("session", session_token, domain="cloud.example.com", path="/")
+
+    recovered = client.get("/api/auth/me")
+    accepted_legacy = client.post(
+        "/api/auth/logout", headers=csrf_headers(legacy_token)
+    )
+
+    assert recovered.status_code == 200
+    assert recovered.json()["csrf_token"] == derive_csrf_token(
+        cloud_app.state.config.session_secret, session_token
+    )
+    assert recovered.json()["csrf_token"] != legacy_token
+    assert accepted_legacy.status_code == 200
+
+
 def test_recovered_csrf_token_rejects_wrong_origin_and_token(cloud_app, client):
     create_user(cloud_app, "csrf-rejection-user")
     login(client, username="csrf-rejection-user")

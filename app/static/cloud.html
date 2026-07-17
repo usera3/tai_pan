@@ -58,6 +58,7 @@
         <div class="field"><i data-lucide="check"></i><input id="confirm-password" type="password" autocomplete="new-password" minlength="12" required></div>
         <p id="password-message" class="form-message" role="status"></p>
         <button id="password-submit" class="button primary wide" type="submit"><i data-lucide="save"></i><span>保存新密码</span></button>
+        <button id="password-logout-button" class="button secondary wide" type="button"><i data-lucide="log-out"></i><span>退出并切换账号</span></button>
       </form>
     </section>
   </main>
@@ -105,8 +106,8 @@
                 <label class="compact-field">有效期
                   <select id="upload-model" aria-label="临时文件有效期">
                     <option value="0">24 小时</option>
-                    <option value="2" selected>3 天</option>
-                    <option value="1">7 天</option>
+                    <option value="1" selected>3 天</option>
+                    <option value="2">7 天</option>
                   </select>
                 </label>
                 <button id="choose-files" class="button secondary" type="button"><i data-lucide="plus"></i><span>选择文件</span></button>

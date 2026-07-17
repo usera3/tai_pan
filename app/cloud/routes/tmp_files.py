@@ -171,6 +171,21 @@ async def quota(
     )
 
 
+@router.get("/cloud/quota")
+async def cloud_quota(
+    request: Request,
+    user: User = Depends(active_user),
+) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "data": {
+            "used": _repository(request).user_storage_bytes(user.id),
+            "total": request.app.state.config.user_quota_bytes,
+        },
+        "message": "",
+    }
+
+
 @router.get("/files")
 async def files(
     request: Request,
@@ -205,7 +220,7 @@ async def files(
 async def upload(
     request: Request,
     file: UploadFile = File(...),
-    model: int = Form(default=2),
+    model: int = Form(default=1),
     storage: Literal["tmp", "cloud"] = Form(default="tmp"),
     user: User = Depends(active_user_with_csrf),
 ) -> dict[str, Any]:
@@ -335,6 +350,16 @@ async def download_file(
 
 @router.get("/files/{ukey}/download")
 async def download_permanent_file(
+    ukey: IdentifierPath,
+    request: Request,
+    source: Literal["cloud"] = Query(default="cloud"),
+    user: User = Depends(active_user),
+) -> Any:
+    return download_cloud_file(request, user, ukey)
+
+
+@router.head("/files/{ukey}/download")
+async def preflight_permanent_download(
     ukey: IdentifierPath,
     request: Request,
     source: Literal["cloud"] = Query(default="cloud"),

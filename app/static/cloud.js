@@ -1,17 +1,19 @@
 "use strict";
 
-const CLOUD_QUOTA_BYTES = 1024 * 1024 * 1024;
 const state = {
   user: null,
   csrf: null,
   files: [],
   links: [],
   settings: null,
+  quota: null,
   users: [],
   invitations: [],
   uploads: [],
   uploading: false,
   confirmAction: null,
+  activeUploads: new Set(),
+  generation: 0,
 };
 
 const viewTitles = { files: "文件", links: "直链", settings: "设置", admin: "管理" };
@@ -80,12 +82,65 @@ async function api(path, options = {}) {
   return payload;
 }
 
-function showAuth(message = "") {
-  state.user = null;
-  state.csrf = null;
+function abortActiveUploads() {
+  state.activeUploads.forEach((xhr) => xhr.abort());
+  state.activeUploads.clear();
+  state.uploading = false;
+}
+
+function closeUserDialogs() {
+  ["confirm-dialog", "link-dialog", "invitation-dialog", "secret-dialog"].forEach((id) => {
+    const dialog = byId(id);
+    if (dialog.open) dialog.close();
+  });
+  byId("confirm-title").textContent = "确认";
+  byId("confirm-copy").textContent = "";
+  byId("secret-title").textContent = "凭据";
+  byId("secret-value").value = "";
+}
+
+function clearUserScopedState() {
+  state.generation += 1;
+  abortActiveUploads();
   state.files = [];
   state.links = [];
   state.settings = null;
+  state.quota = null;
+  state.users = [];
+  state.invitations = [];
+  state.uploads = [];
+  state.confirmAction = null;
+  closeUserDialogs();
+  ["password-form", "settings-form", "link-form", "invitation-form"].forEach((id) => byId(id).reset());
+  byId("upload-input").value = "";
+  byId("upload-storage").value = "tmp";
+  byId("upload-model").value = "1";
+  byId("files-body").replaceChildren();
+  byId("links-body").replaceChildren();
+  byId("users-body").replaceChildren();
+  byId("invitations-body").replaceChildren();
+  byId("sidebar-username").textContent = "";
+  byId("topbar-username").textContent = "";
+  byId("sidebar-role").textContent = "";
+  byId("password-user").textContent = "";
+  byId("cloud-quota-text").textContent = "空间信息不可用";
+  byId("cloud-quota-bar").style.width = "0%";
+  byId("cloud-quota-bar").parentElement.setAttribute("aria-valuenow", "0");
+  byId("toast-region").replaceChildren();
+  byId("download-bin").replaceChildren();
+  setMessage(byId("password-message"));
+  setMessage(byId("settings-message"));
+  setMessage(byId("link-message"));
+  setMessage(byId("invitation-message"));
+  renderKeyStatus();
+  renderUploads();
+  updateUploadControls();
+}
+
+function showAuth(message = "") {
+  clearUserScopedState();
+  state.user = null;
+  state.csrf = null;
   removeAdminNav();
   byId("boot-status").hidden = true;
   byId("password-shell").hidden = true;
@@ -128,6 +183,7 @@ function removeAdminNav() {
 }
 
 async function showAuthenticated(user, csrfToken) {
+  clearUserScopedState();
   state.user = user;
   state.csrf = csrfToken;
   byId("boot-status").hidden = true;
@@ -156,7 +212,6 @@ async function showAuthenticated(user, csrfToken) {
   }
   activateView("files");
   initIcons();
-  await loadFiles();
 }
 
 async function bootstrap() {
@@ -222,6 +277,7 @@ async function submitRegistration(event) {
 
 async function changePassword(event) {
   event.preventDefault();
+  const generation = state.generation;
   const current = byId("current-password").value;
   const next = byId("new-password").value;
   if (next !== byId("confirm-password").value) {
@@ -232,6 +288,7 @@ async function changePassword(event) {
   setBusy(button, true, "保存中");
   try {
     const payload = await api("/api/auth/change-password", { method: "POST", body: { current_password: current, new_password: next } });
+    if (generation !== state.generation) return;
     byId("password-form").reset();
     await showAuthenticated(payload.user, payload.csrf_token);
   } catch (error) {
@@ -241,8 +298,8 @@ async function changePassword(event) {
   }
 }
 
-async function logout() {
-  const button = byId("logout-button");
+async function logout(event) {
+  const button = event?.currentTarget || byId("logout-button");
   setBusy(button, true, "");
   try { await api("/api/auth/logout", { method: "POST" }); } catch (error) { toast(error.message); }
   showAuth();
@@ -296,28 +353,57 @@ function iconButton(icon, label, action, className = "") {
 }
 
 async function loadFiles() {
+  const generation = state.generation;
   byId("files-state").hidden = false;
   byId("files-state").className = "empty-state";
   byId("files-state").textContent = "正在载入文件";
   byId("files-table-wrap").hidden = true;
+  const quotaRequest = loadCloudQuota(generation);
   try {
     const payload = await api("/api/files?source=all");
+    if (generation !== state.generation) return;
     state.files = normalizeList(payload);
     renderFiles();
   } catch (error) {
+    if (generation !== state.generation) return;
     byId("files-state").textContent = error.message;
     byId("files-state").classList.add("error");
+  } finally {
+    await quotaRequest;
   }
+}
+
+function renderCloudQuota() {
+  const used = Number(state.quota?.used);
+  const total = Number(state.quota?.total);
+  if (!Number.isFinite(used) || !Number.isFinite(total) || used < 0 || total <= 0) {
+    byId("cloud-quota-text").textContent = "空间信息不可用";
+    byId("cloud-quota-bar").style.width = "0%";
+    byId("cloud-quota-bar").parentElement.setAttribute("aria-valuenow", "0");
+    return;
+  }
+  const percent = Math.min(100, (used / total) * 100);
+  byId("cloud-quota-text").textContent = `${formatBytes(used)} / ${formatBytes(total)}`;
+  byId("cloud-quota-bar").style.width = `${percent}%`;
+  byId("cloud-quota-bar").parentElement.setAttribute("aria-valuenow", String(Math.round(percent)));
+}
+
+async function loadCloudQuota(generation) {
+  try {
+    const payload = await api("/api/cloud/quota");
+    if (generation !== state.generation) return;
+    state.quota = payload?.data ?? payload;
+  } catch (_error) {
+    if (generation !== state.generation) return;
+    state.quota = null;
+  }
+  renderCloudQuota();
 }
 
 function renderFiles() {
   const body = byId("files-body");
   body.replaceChildren();
-  const cloudUsed = state.files.filter((file) => file.source === "cloud").reduce((total, file) => total + (Number(file.size) || 0), 0);
-  const percent = Math.min(100, (cloudUsed / CLOUD_QUOTA_BYTES) * 100);
-  byId("cloud-quota-text").textContent = `${formatBytes(cloudUsed)} / 1 GB`;
-  byId("cloud-quota-bar").style.width = `${percent}%`;
-  byId("cloud-quota-bar").parentElement.setAttribute("aria-valuenow", String(Math.round(percent)));
+  renderCloudQuota();
   if (state.files.length === 0) {
     byId("files-state").hidden = false;
     byId("files-state").textContent = "暂无文件";
@@ -362,13 +448,20 @@ function backgroundDownload(url) {
 }
 
 async function downloadFile(file) {
+  const generation = state.generation;
   const id = encodeURIComponent(fileIdentity(file));
   if (file.source === "cloud") {
-    backgroundDownload(`/api/files/${id}/download?source=cloud`);
+    try {
+      const path = `/api/files/${id}/download?source=cloud`;
+      await api(path, { method: "HEAD" });
+      if (generation !== state.generation) return;
+      backgroundDownload(path);
+    } catch (error) { toast(error.message); }
     return;
   }
   try {
     const payload = await api(`/api/files/${id}/download?source=tmp`, { method: "POST" });
+    if (generation !== state.generation) return;
     const link = payload?.data?.link || payload?.data?.url;
     if (!link) throw new Error("下载地址不可用");
     const frame = document.createElement("iframe");
@@ -454,11 +547,13 @@ function renderUploads() {
 
 function uploadItem(item) {
   return new Promise((resolve) => {
+    const generation = state.generation;
     const form = new FormData();
     form.append("storage", byId("upload-storage").value);
     form.append("model", byId("upload-model").value);
     form.append("file", item.file, item.file.name);
     const xhr = new XMLHttpRequest();
+    state.activeUploads.add(xhr);
     item.status = "uploading";
     item.message = "上传中";
     renderUploads();
@@ -468,6 +563,8 @@ function uploadItem(item) {
       renderUploads();
     });
     xhr.addEventListener("load", () => {
+      state.activeUploads.delete(xhr);
+      if (generation !== state.generation) { resolve(); return; }
       let payload = {};
       try { payload = JSON.parse(xhr.responseText); } catch (_error) { payload = {}; }
       if (xhr.status >= 200 && xhr.status < 300 && payload.ok !== false) {
@@ -481,7 +578,12 @@ function uploadItem(item) {
       renderUploads();
       resolve();
     });
-    xhr.addEventListener("error", () => { item.status = "failed"; item.message = "上传连接失败"; renderUploads(); resolve(); });
+    xhr.addEventListener("error", () => {
+      state.activeUploads.delete(xhr);
+      if (generation === state.generation) { item.status = "failed"; item.message = "上传连接失败"; renderUploads(); }
+      resolve();
+    });
+    xhr.addEventListener("abort", () => { state.activeUploads.delete(xhr); resolve(); });
     xhr.open("POST", "/api/uploads");
     if (state.csrf) xhr.setRequestHeader("X-CSRF-Token", state.csrf);
     xhr.send(form);
@@ -490,9 +592,14 @@ function uploadItem(item) {
 
 async function uploadAll() {
   if (state.uploading) return;
+  const generation = state.generation;
   state.uploading = true;
   renderUploads();
-  for (const item of state.uploads) if (["queued", "failed"].includes(item.status)) await uploadItem(item);
+  for (const item of state.uploads) {
+    if (generation !== state.generation) return;
+    if (["queued", "failed"].includes(item.status)) await uploadItem(item);
+  }
+  if (generation !== state.generation) return;
   state.uploading = false;
   renderUploads();
   await loadFiles();
@@ -505,14 +612,17 @@ function updateUploadControls() {
 }
 
 async function loadSettings() {
+  const generation = state.generation;
   setMessage(byId("settings-message"), "正在载入");
   byId("api-key").value = "";
   try {
-    state.settings = await api("/api/settings");
+    const settings = await api("/api/settings");
+    if (generation !== state.generation) return;
+    state.settings = settings;
     byId("custom-domain").value = state.settings.custom_domain || "";
     renderKeyStatus();
     setMessage(byId("settings-message"));
-  } catch (error) { setMessage(byId("settings-message"), error.message, "error"); }
+  } catch (error) { if (generation === state.generation) setMessage(byId("settings-message"), error.message, "error"); }
 }
 
 function renderKeyStatus() {
@@ -525,45 +635,62 @@ function renderKeyStatus() {
 
 async function saveSettings(event) {
   event.preventDefault();
+  const generation = state.generation;
   const button = byId("settings-save");
   setBusy(button, true, "保存中");
   try {
-    state.settings = await api("/api/settings", { method: "PUT", body: { api_key: byId("api-key").value, custom_domain: byId("custom-domain").value } });
+    const settings = await api("/api/settings", { method: "PUT", body: { api_key: byId("api-key").value, custom_domain: byId("custom-domain").value } });
+    if (generation !== state.generation) return;
+    state.settings = settings;
     byId("api-key").value = "";
     renderKeyStatus();
     setMessage(byId("settings-message"), "设置已保存", "success");
   } catch (error) {
+    if (generation !== state.generation) return;
     byId("api-key").value = "";
     setMessage(byId("settings-message"), error.message, "error");
   } finally { setBusy(button, false); }
 }
 
 async function testSettings() {
+  const generation = state.generation;
   const button = byId("settings-test");
   setBusy(button, true, "测试中");
-  try { await api("/api/settings/test", { method: "POST" }); setMessage(byId("settings-message"), "连接成功", "success"); }
-  catch (error) { setMessage(byId("settings-message"), error.message, "error"); }
+  try { await api("/api/settings/test", { method: "POST" }); if (generation === state.generation) setMessage(byId("settings-message"), "连接成功", "success"); }
+  catch (error) { if (generation === state.generation) setMessage(byId("settings-message"), error.message, "error"); }
   finally { setBusy(button, false); }
 }
 
 function clearSettingsKey() {
   openConfirm("清除 API Key", "确认清除当前钛盘 API Key？", async () => {
+    const generation = state.generation;
     try {
-      state.settings = await api("/api/settings/key", { method: "DELETE" });
+      const settings = await api("/api/settings/key", { method: "DELETE" });
+      if (generation !== state.generation) return;
+      state.settings = settings;
       byId("api-key").value = "";
       renderKeyStatus();
       setMessage(byId("settings-message"), "API Key 已清除", "success");
-    } catch (error) { setMessage(byId("settings-message"), error.message, "error"); }
+    } catch (error) { if (generation === state.generation) setMessage(byId("settings-message"), error.message, "error"); }
   });
 }
 
 async function loadLinks() {
+  const generation = state.generation;
   byId("links-state").hidden = false;
   byId("links-state").className = "empty-state";
   byId("links-state").textContent = "正在载入直链";
   byId("links-table-wrap").hidden = true;
-  try { state.links = normalizeList(await api("/api/links")); renderLinks(); }
-  catch (error) { byId("links-state").textContent = error.message; byId("links-state").classList.add("error"); }
+  try {
+    const links = await api("/api/links");
+    if (generation !== state.generation) return;
+    state.links = normalizeList(links);
+    renderLinks();
+  } catch (error) {
+    if (generation !== state.generation) return;
+    byId("links-state").textContent = error.message;
+    byId("links-state").classList.add("error");
+  }
 }
 
 function linkKey(link) { return String(link.dkey || link.direct_key || ""); }
@@ -619,6 +746,7 @@ async function createLink(event) {
 
 async function loadAdmin() {
   if (state.user?.role !== "admin") return;
+  const generation = state.generation;
   byId("users-state").hidden = false;
   byId("users-state").textContent = "正在载入用户";
   byId("users-table-wrap").hidden = true;
@@ -626,10 +754,14 @@ async function loadAdmin() {
   byId("invitations-state").textContent = "正在载入邀请";
   byId("invitations-table-wrap").hidden = true;
   try {
-    [state.users, state.invitations] = await Promise.all([api("/api/admin/users"), api("/api/admin/invitations")]);
+    const [users, invitations] = await Promise.all([api("/api/admin/users"), api("/api/admin/invitations")]);
+    if (generation !== state.generation) return;
+    state.users = users;
+    state.invitations = invitations;
     renderUsers();
     renderInvitations();
   } catch (error) {
+    if (generation !== state.generation) return;
     byId("users-state").textContent = error.message;
     byId("users-state").className = "empty-state error";
     byId("invitations-state").textContent = error.message;
@@ -723,6 +855,7 @@ function bindEvents() {
   byId("register-form").addEventListener("submit", submitRegistration);
   byId("password-form").addEventListener("submit", changePassword);
   byId("logout-button").addEventListener("click", logout);
+  byId("password-logout-button").addEventListener("click", logout);
   document.querySelectorAll(".nav-item[data-view]").forEach((button) => button.addEventListener("click", () => activateView(button.dataset.view)));
   byId("refresh-files").addEventListener("click", loadFiles);
   byId("choose-files").addEventListener("click", () => byId("upload-input").click());

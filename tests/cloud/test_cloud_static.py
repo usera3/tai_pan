@@ -69,7 +69,29 @@ def test_cloud_download_get_is_registered_without_removing_post_compatibility(cl
     operations = cloud_app.openapi()["paths"]["/api/files/{ukey}/download"]
 
     assert "get" in operations
+    assert "head" in operations
     assert "post" in operations
+
+
+def test_cloud_static_contract_uses_three_day_default_and_resets_user_scoped_ui():
+    static_dir = Path(__file__).parents[2] / "app" / "static"
+    html = (static_dir / "cloud.html").read_text(encoding="utf-8")
+    script = (static_dir / "cloud.js").read_text(encoding="utf-8")
+
+    assert '<option value="1" selected>3 天</option>' in html
+    assert '<option value="2">7 天</option>' in html
+    assert 'id="password-logout-button"' in html
+    for required in (
+        "abortActiveUploads",
+        "closeUserDialogs",
+        "state.uploads = []",
+        "state.users = []",
+        "state.invitations = []",
+        "state.confirmAction = null",
+        'api("/api/cloud/quota")',
+        'method: "HEAD"',
+    ):
+        assert required in script
 
 
 def test_local_root_and_assets_are_unchanged(tmp_path: Path):

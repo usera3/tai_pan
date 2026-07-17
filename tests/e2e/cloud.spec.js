@@ -65,7 +65,8 @@ async function mockCloud(page, options = {}) {
     if (url.pathname === "/api/auth/login") {
       if (options.disabledLogin) return json(route, { detail: "Invalid username or password" }, 401);
       state.authenticated = true;
-      state.user = { ...state.loginUser };
+      const username = JSON.parse(record.body).username;
+      state.user = { ...(options.loginUsers?.[username] || state.loginUser) };
       return json(route, { user: state.user, csrf_token: state.csrf });
     }
     if (url.pathname === "/api/auth/register") {
@@ -91,9 +92,16 @@ async function mockCloud(page, options = {}) {
       state.settings.key_configured = false;
       return json(route, state.settings);
     }
-    if (url.pathname === "/api/quota") return json(route, { ok: true, data: { used: 1024, total: 10240 }, message: "" });
+    if (url.pathname === "/api/cloud/quota") {
+      if (options.cloudQuotaStatus) return json(route, { detail: "Quota unavailable" }, options.cloudQuotaStatus);
+      return json(route, { ok: true, data: { used: 4096, total: 10240 }, message: "" });
+    }
     if (url.pathname === "/api/files" && request.method() === "GET") return json(route, { ok: true, data: state.files, message: "" });
     if (url.pathname === "/api/uploads") return json(route, { ok: true, data: { id: "uploaded", name: "upload.txt", source: record.body.includes('name=\"storage\"\r\n\r\ncloud') ? "cloud" : "tmp" }, message: "File uploaded" });
+    if (url.pathname === "/api/files/cloud-1/download" && request.method() === "HEAD") {
+      if (options.cloudPreflightStatus) return route.fulfill({ status: options.cloudPreflightStatus });
+      return route.fulfill({ status: 200 });
+    }
     if (url.pathname === "/api/files/cloud-1/download" && request.method() === "GET") {
       return route.fulfill({ status: 200, headers: { "Content-Disposition": 'attachment; filename="permanent.pdf"' }, body: "cloud-file" });
     }
@@ -202,6 +210,38 @@ test("forced password change blocks normal views until completion", async ({ pag
   expect(mutation(state, "/api/auth/change-password", "POST").headers["x-csrf-token"]).toBe(state.csrf);
 });
 
+test("forced password screen lets the user switch accounts with the in-memory CSRF token", async ({ page }) => {
+  const forced = { ...user, username: "forced", must_change_password: true };
+  const state = await mockCloud(page, { loginUser: forced });
+  await openCloud(page);
+  await page.locator("#login-username").fill("forced");
+  await page.locator("#login-password").fill("temporary-password");
+  await page.locator("#login-submit").click();
+  await expect(page.locator("#password-shell")).toBeVisible();
+
+  await page.locator("#password-logout-button").click();
+
+  await expect(page.locator("#auth-shell")).toBeVisible();
+  expect(mutation(state, "/api/auth/logout", "POST").headers["x-csrf-token"]).toBe(state.csrf);
+});
+
+test("switching accounts clears queued files before the next user can see or upload them", async ({ page }) => {
+  const first = { ...user, id: "first", username: "first" };
+  const second = { ...user, id: "second", username: "second" };
+  const state = await mockCloud(page, { loginUsers: { first, second } });
+  await openCloud(page);
+  await signIn(page, "first");
+  await page.locator("#upload-input").setInputFiles({ name: "first-account-private.txt", mimeType: "text/plain", buffer: Buffer.from("private") });
+  await expect(page.locator("#upload-queue")).toContainText("first-account-private.txt");
+
+  await page.locator("#logout-button").click();
+  await signIn(page, "second");
+
+  await expect(page.locator("#upload-queue")).not.toContainText("first-account-private.txt");
+  await expect(page.locator("#upload-all")).toBeDisabled();
+  expect(state.requests.filter((request) => request.path === "/api/uploads")).toHaveLength(0);
+});
+
 test("files, uploads, settings, links and background downloads use source and CSRF contracts", async ({ page }) => {
   const state = await mockCloud(page);
   await openCloud(page);
@@ -216,7 +256,7 @@ test("files, uploads, settings, links and background downloads use source and CS
   await expect(page.locator("#upload-queue")).toContainText("完成");
   const defaultUpload = mutation(state, "/api/uploads", "POST");
   expect(defaultUpload.headers["x-csrf-token"]).toBe(state.csrf);
-  expect(defaultUpload.body).toContain('name="model"\r\n\r\n2');
+  expect(defaultUpload.body).toContain('name="model"\r\n\r\n1');
   expect(defaultUpload.body).toContain('name="storage"\r\n\r\ntmp');
 
   await page.locator("#upload-input").setInputFiles({ name: "permanent.txt", mimeType: "text/plain", buffer: Buffer.from("permanent") });
@@ -230,6 +270,7 @@ test("files, uploads, settings, links and background downloads use source and CS
   await page.locator('[data-file-id="cloud-1"] [data-action="download"]').click();
   await cloudDownload;
   expect(page.url()).toBe(beforeCloud);
+  expect(mutation(state, "/api/files/cloud-1/download?source=cloud", "HEAD")).toBeTruthy();
   expect(mutation(state, "/api/files/cloud-1/download?source=cloud", "GET")).toBeTruthy();
 
   const beforeTmp = page.url();
@@ -273,6 +314,18 @@ test("files, uploads, settings, links and background downloads use source and CS
   expect(mutation(state, "/api/links/MANUAL-2", "DELETE").headers["x-csrf-token"]).toBe(state.csrf);
 });
 
+test("cloud download preflight shows a visible error instead of opening a forbidden iframe", async ({ page }) => {
+  const state = await mockCloud(page, { cloudPreflightStatus: 403 });
+  await openCloud(page);
+  await signIn(page);
+
+  await page.locator('[data-file-id="cloud-1"] [data-action="download"]').click();
+
+  await expect(page.locator("#toast-region")).toContainText("没有权限执行此操作");
+  expect(mutation(state, "/api/files/cloud-1/download?source=cloud", "HEAD")).toBeTruthy();
+  expect(mutation(state, "/api/files/cloud-1/download?source=cloud", "GET")).toBeFalsy();
+});
+
 test("admin navigation and controls are role gated", async ({ page }) => {
   const state = await mockCloud(page, { loginUser: user });
   await openCloud(page);
@@ -311,29 +364,66 @@ test("disabled login has a complete error state", async ({ page }) => {
   await expect(page.locator("#auth-shell")).toBeVisible();
 });
 
+async function assertCloudLayout(page) {
+  await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)).toBeLessThanOrEqual(0);
+  const geometry = await page.evaluate(() => {
+    const nav = document.querySelector("#primary-nav")?.getBoundingClientRect();
+    const topbar = document.querySelector(".topbar")?.getBoundingClientRect();
+    const active = document.querySelector(".view.is-active")?.getBoundingClientRect();
+    const dialog = document.querySelector("dialog[open]")?.getBoundingClientRect();
+    return { nav, topbar, active, dialog, width: innerWidth, mobile: matchMedia("(max-width: 760px)").matches };
+  });
+  if (geometry.mobile && geometry.nav) {
+    expect(geometry.topbar.bottom).toBeLessThanOrEqual(geometry.nav.top);
+    expect(geometry.active.top).toBeGreaterThanOrEqual(geometry.topbar.bottom);
+  } else if (geometry.nav) {
+    expect(geometry.active.left).toBeGreaterThanOrEqual(geometry.nav.right);
+    expect(geometry.active.top).toBeGreaterThanOrEqual(geometry.topbar.bottom);
+  }
+  if (geometry.dialog) {
+    expect(geometry.dialog.left).toBeGreaterThanOrEqual(0);
+    expect(geometry.dialog.right).toBeLessThanOrEqual(geometry.width);
+  }
+}
+
 for (const viewport of [
   { name: "desktop", width: 1440, height: 900 },
   { name: "mobile", width: 390, height: 844 },
 ]) {
-  test(`${viewport.name} layout has no document overflow or navigation overlap`, async ({ page }) => {
+  test(`${viewport.name} cloud screens and dialogs have no overlap or overflow`, async ({ page }) => {
+    test.setTimeout(60_000);
     await page.setViewportSize({ width: viewport.width, height: viewport.height });
-    await mockCloud(page, { loginUser: admin });
+    const forced = { ...user, username: "forced-layout", must_change_password: true };
+    const state = await mockCloud(page, { loginUsers: { admin, "forced-layout": forced } });
     await openCloud(page);
+    await assertCloudLayout(page);
+    await page.screenshot({ path: `test-results/cloud-${viewport.name}-auth.png`, fullPage: true });
+    await page.locator("#login-username").fill("forced-layout");
+    await page.locator("#login-password").fill("temporary-password");
+    await page.locator("#login-submit").click();
+    await expect(page.locator("#password-shell")).toBeVisible();
+    await assertCloudLayout(page);
+    await page.screenshot({ path: `test-results/cloud-${viewport.name}-forced-password.png`, fullPage: true });
+    await page.locator("#password-logout-button").click();
     await signIn(page, "admin");
-    await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)).toBeLessThanOrEqual(0);
-    const geometry = await page.evaluate(() => {
-      const nav = document.querySelector("#primary-nav").getBoundingClientRect();
-      const topbar = document.querySelector(".topbar").getBoundingClientRect();
-      const active = document.querySelector(".view.is-active").getBoundingClientRect();
-      return { nav, topbar, active, mobile: matchMedia("(max-width: 760px)").matches };
-    });
-    if (geometry.mobile) {
-      expect(geometry.topbar.bottom).toBeLessThanOrEqual(geometry.nav.top);
-      expect(geometry.active.top).toBeGreaterThanOrEqual(geometry.topbar.bottom);
-    } else {
-      expect(geometry.active.left).toBeGreaterThanOrEqual(geometry.nav.right);
-      expect(geometry.active.top).toBeGreaterThanOrEqual(geometry.topbar.bottom);
+    for (const [view, name] of [["files", "files"], ["links", "links"], ["settings", "settings"], ["admin", "admin"]]) {
+      await page.locator(`[data-view="${view}"]`).click();
+      await assertCloudLayout(page);
+      await page.screenshot({ path: `test-results/cloud-${viewport.name}-${name}.png`, fullPage: true });
     }
-    await page.screenshot({ path: `test-results/cloud-${viewport.name}.png` });
+    await page.locator('[data-view="links"]').click();
+    await page.locator("#new-link").click();
+    await assertCloudLayout(page);
+    await page.screenshot({ path: `test-results/cloud-${viewport.name}-link-dialog.png`, fullPage: true });
+    await page.locator("#link-cancel").click();
+    await page.locator('[data-view="admin"]').click();
+    await page.locator("#create-invitation").click();
+    await assertCloudLayout(page);
+    await page.screenshot({ path: `test-results/cloud-${viewport.name}-invitation-dialog.png`, fullPage: true });
+    await page.locator("#invitation-cancel").click();
+    await page.locator('[data-user-id="user-1"] [data-action="disable"]').click();
+    await assertCloudLayout(page);
+    await page.screenshot({ path: `test-results/cloud-${viewport.name}-confirm-dialog.png`, fullPage: true });
+    expect(state.requests.filter((request) => request.path === "/api/cloud/quota")).not.toHaveLength(0);
   });
 }

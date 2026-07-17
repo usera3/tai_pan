@@ -579,7 +579,7 @@ def test_cloud_upload_defaults_to_three_days_rejects_99_and_cleans_staging(
 
     assert uploaded.status_code == 200
     assert remote.uploads == [
-        (tenant.key, "report.txt", 2, "text/plain", b"content")
+        (tenant.key, "report.txt", 1, "text/plain", b"content")
     ]
     assert rejected.status_code == 422
     assert empty.status_code == 422
@@ -621,7 +621,7 @@ def test_cloud_upload_enforces_exact_file_limit_normalizes_name_and_permissions(
     assert accepted.status_code == 200
     assert rejected.status_code == 413
     assert remote.uploads == [
-        (tenant.key, "report.txt", 2, "text/plain", b"abc")
+        (tenant.key, "report.txt", 1, "text/plain", b"abc")
     ]
     assert remote.upload_permissions == [(0o700, 0o600)]
     assert application.state.config.storage_path is not None
@@ -660,7 +660,7 @@ def test_cloud_upload_forwards_the_sanitized_unicode_basename(
 
     assert response.status_code == 200
     assert remote.uploads == [
-        (tenant.key, "safe-测试.txt", 2, "text/plain", b"content")
+        (tenant.key, "safe-测试.txt", 1, "text/plain", b"content")
     ]
 
 

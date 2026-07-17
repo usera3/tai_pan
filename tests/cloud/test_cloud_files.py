@@ -93,12 +93,19 @@ def cloud_app(config: CloudConfig):
 def make_tenant(cloud_app):
     clients: list[TestClient] = []
 
-    def create(username: str, *, role: str = "user", tmp_key: str | None = None):
+    def create(
+        username: str,
+        *,
+        role: str = "user",
+        tmp_key: str | None = None,
+        must_change_password: bool = False,
+    ):
         repository = cloud_app.state.repository
         user = repository.create_user(
             username,
             cloud_app.state.password_service.hash("tenant password"),
             role=role,
+            must_change_password=must_change_password,
             now=NOW,
         )
         if tmp_key is not None:
@@ -132,6 +139,30 @@ def cloud_upload(tenant: Tenant, name: str, content: bytes, content_type="text/p
         files={"file": (name, content, content_type)},
         headers=tenant.headers,
     )
+
+
+def test_cloud_quota_is_authenticated_owner_scoped_and_redacted(cloud_app, make_tenant):
+    owner = make_tenant("quota-owner")
+    other = make_tenant("quota-other")
+    uploaded = cloud_upload(owner, "quota.txt", b"quota").json()["data"]
+
+    owner_response = owner.client.get("/api/cloud/quota")
+    other_response = other.client.get("/api/cloud/quota")
+    with TestClient(cloud_app, base_url=PUBLIC_ORIGIN) as anonymous:
+        unauthenticated = anonymous.get("/api/cloud/quota")
+
+    assert owner_response.status_code == other_response.status_code == 200
+    assert owner_response.json() == {
+        "ok": True,
+        "data": {"used": 5, "total": cloud_app.state.config.user_quota_bytes},
+        "message": "",
+    }
+    assert other_response.json()["data"]["used"] == 0
+    assert unauthenticated.status_code == 401
+    rendered = owner_response.text
+    assert uploaded["id"] not in rendered
+    assert str(cloud_app.state.config.storage_path) not in rendered
+    assert cloud_app.state.config.session_secret not in rendered
 
 
 def test_permanent_upload_needs_no_tmp_key_and_never_constructs_tmp_client(
@@ -239,6 +270,48 @@ def test_cloud_download_is_owner_only_uses_accel_redirect_and_safe_unicode_heade
     assert str(cloud_app.state.config.storage_path) not in " ".join(
         item.text for item in denied
     )
+
+
+def test_cloud_download_head_preflight_enforces_owner_and_active_authentication(
+    cloud_app, make_tenant
+):
+    owner = make_tenant("head-owner")
+    other = make_tenant("head-other")
+    admin = make_tenant("head-admin", role="admin")
+    forced = make_tenant("head-forced", must_change_password=True)
+    uploaded = cloud_upload(owner, "head.txt", b"head").json()["data"]
+    path = f"/api/files/{uploaded['id']}/download?source=cloud"
+
+    owner_get = owner.client.get(path)
+    owner_head = owner.client.head(path)
+    with TestClient(cloud_app, base_url=PUBLIC_ORIGIN) as anonymous:
+        responses = [
+            other.client.get(path),
+            other.client.head(path),
+            admin.client.get(path),
+            admin.client.head(path),
+            forced.client.get(path),
+            forced.client.head(path),
+            anonymous.get(path),
+            anonymous.head(path),
+            owner.client.head(
+                "/api/files/00000000-0000-0000-0000-000000000000/download?source=cloud"
+            ),
+        ]
+
+    assert owner_get.status_code == owner_head.status_code == 200
+    assert owner_head.content == b""
+    assert [response.status_code for response in responses] == [
+        403,
+        403,
+        403,
+        403,
+        403,
+        403,
+        401,
+        401,
+        403,
+    ]
 
 
 def test_cloud_delete_cleans_metadata_when_disk_is_missing_and_then_returns_same_403(
