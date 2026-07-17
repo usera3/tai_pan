@@ -118,14 +118,23 @@ async def test_upload_file_streams_a_file_object_in_bounded_reads():
                 raise AssertionError("stream must not be read without a bound")
             return super().read(size)
 
-    captured: list[httpx.Request] = []
+    class ObservingTransport(httpx.AsyncBaseTransport):
+        def __init__(self):
+            self.reads_before_send: list[int] | None = None
+            self.body = b""
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        captured.append(request)
-        return httpx.Response(200, json={"status": 1, "data": "STREAMED-UKEY"})
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            self.reads_before_send = list(source.read_sizes)
+            self.body = await request.aread()
+            return httpx.Response(
+                200,
+                json={"status": 1, "data": "STREAMED-UKEY"},
+                request=request,
+            )
 
     source = BoundedReadFile(b"streamed-content")
-    client = TmpLinkClient("stream-key", transport=httpx.MockTransport(handler))
+    transport = ObservingTransport()
+    client = TmpLinkClient("stream-key", transport=transport)
 
     result = await client.upload_file(
         "report.txt",
@@ -134,10 +143,21 @@ async def test_upload_file_streams_a_file_object_in_bounded_reads():
         content_type="text/plain",
     )
 
-    assert b'streamed-content' in captured[0].content
+    assert transport.reads_before_send == []
+    assert b"streamed-content" in transport.body
     assert source.read_sizes
-    assert all(size > 0 for size in source.read_sizes)
+    assert all(0 < size <= 64 * 1024 for size in source.read_sizes)
     assert result.data == "STREAMED-UKEY"
+
+
+def test_client_keeps_api_key_private_and_has_an_explicit_safe_repr():
+    api_key = "private-key-must-not-render"
+    client = TmpLinkClient(api_key, transport=httpx.MockTransport(lambda request: None))
+
+    assert not hasattr(client, "api_key")
+    assert "_api_key" in vars(client)
+    assert api_key not in repr(client)
+    assert repr(client).startswith("TmpLinkClient(")
 
 
 @pytest.mark.asyncio
@@ -327,3 +347,22 @@ async def test_network_errors_are_translated_and_redacted(remote_error, expected
         await client.quota()
 
     assert "test-key" not in str(error.value)
+    assert error.value.__context__ is None
+    assert error.value.__cause__ is None
+
+
+@pytest.mark.asyncio
+async def test_http_status_translation_drops_the_httpx_exception_chain():
+    api_key = "request-body-secret-key"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, request=request)
+
+    client = TmpLinkClient(api_key, transport=httpx.MockTransport(handler))
+
+    with pytest.raises(TmpLinkConnectionError) as captured:
+        await client.quota()
+
+    assert captured.value.__context__ is None
+    assert captured.value.__cause__ is None
+    assert api_key not in repr(captured.value)

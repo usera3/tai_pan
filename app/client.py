@@ -49,9 +49,12 @@ class TmpLinkClient:
         transport: httpx.AsyncBaseTransport | None = None,
         timeout: float = 30.0,
     ):
-        self.api_key = api_key
+        self._api_key = api_key
         self.transport = transport
         self.timeout = timeout
+
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}(timeout={self.timeout!r})"
 
     async def quota(self) -> ServiceResult:
         return await self._direct("quota")
@@ -128,7 +131,7 @@ class TmpLinkClient:
             raise ValueError(f"storage model must be one of {sorted(ALLOWED_STORAGE_MODELS)}")
         return await self._request(
             UPLOAD_URL,
-            data={"key": self.api_key, "model": str(model)},
+            data={"key": self._api_key, "model": str(model)},
             files={"file": (file_name, file, content_type)},
         )
 
@@ -139,7 +142,7 @@ class TmpLinkClient:
         empty_is_success: bool = False,
         **fields: Any,
     ) -> ServiceResult:
-        form = {"action": action, "key": self.api_key}
+        form = {"action": action, "key": self._api_key}
         form.update(
             {
                 key: str(value)
@@ -160,6 +163,7 @@ class TmpLinkClient:
         files: dict[str, tuple[str, bytes | BinaryIO, str]] | None = None,
         empty_is_success: bool = False,
     ) -> ServiceResult:
+        translated_error: TmpLinkError | None = None
         try:
             async with httpx.AsyncClient(
                 transport=self.transport,
@@ -167,14 +171,19 @@ class TmpLinkClient:
             ) as client:
                 response = await client.post(url, data=data, files=files)
                 response.raise_for_status()
-        except httpx.TimeoutException as exc:
-            raise TmpLinkTimeoutError("Remote service timed out") from None
-        except (httpx.ConnectError, httpx.NetworkError) as exc:
-            raise TmpLinkConnectionError("Unable to connect to remote service") from None
+        except httpx.TimeoutException:
+            translated_error = TmpLinkTimeoutError("Remote service timed out")
+        except (httpx.ConnectError, httpx.NetworkError):
+            translated_error = TmpLinkConnectionError(
+                "Unable to connect to remote service"
+            )
         except httpx.HTTPStatusError as exc:
-            raise TmpLinkConnectionError(
+            translated_error = TmpLinkConnectionError(
                 f"Remote service returned HTTP {exc.response.status_code}"
-            ) from None
+            )
+
+        if translated_error is not None:
+            raise translated_error
 
         try:
             payload = response.json()

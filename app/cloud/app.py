@@ -2,13 +2,15 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from app.client import TmpLinkClient
 from app.cloud.config import CloudConfig
 from app.cloud.db import Database
+from app.cloud.dependencies import active_user, current_user, verify_csrf
 from app.cloud.repository import CloudRepository
 from app.cloud.routes import (
     admin_router,
@@ -19,6 +21,121 @@ from app.cloud.routes import (
 )
 from app.cloud.routes.auth import REGISTRATION_LIMIT, REGISTRATION_WINDOW
 from app.cloud.security import KeyCipher, PasswordService, TokenService
+
+
+UPLOAD_MULTIPART_OVERHEAD_BYTES = 64 * 1024
+
+
+class UploadGuardMiddleware:
+    """Authorize and bound upload requests before multipart parsing begins."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if (
+            scope["type"] != "http"
+            or scope.get("method") != "POST"
+            or scope.get("path") != "/api/uploads"
+        ):
+            await self.app(scope, receive, send)
+            return
+
+        request = Request(scope)
+        try:
+            user = current_user(request, request.app.state.repository)
+            active_user(user)
+            verify_csrf(request, user)
+        except HTTPException as exc:
+            await JSONResponse(
+                status_code=exc.status_code,
+                content={"detail": exc.detail},
+                headers=exc.headers,
+            )(scope, receive, send)
+            return
+
+        body_limit = (
+            request.app.state.config.max_file_bytes
+            + UPLOAD_MULTIPART_OVERHEAD_BYTES
+        )
+        content_length = request.headers.get("content-length")
+        if content_length is not None:
+            try:
+                declared_length = int(content_length)
+            except ValueError:
+                declared_length = body_limit + 1
+            if declared_length < 0 or declared_length > body_limit:
+                await self._reject_too_large(scope, receive, send)
+                return
+
+        received = 0
+        exceeded = False
+        pending_response: list[Message] = []
+
+        async def bounded_receive() -> Message:
+            nonlocal exceeded, received
+            message = await receive()
+            if message["type"] == "http.request":
+                received += len(message.get("body", b""))
+                if received > body_limit:
+                    exceeded = True
+                    return {"type": "http.disconnect"}
+            return message
+
+        async def buffered_send(message: Message) -> None:
+            pending_response.append(message)
+
+        await self.app(scope, bounded_receive, buffered_send)
+
+        if exceeded:
+            await self._reject_too_large(scope, receive, send)
+            return
+        for message in pending_response:
+            await send(message)
+
+    @staticmethod
+    async def _reject_too_large(scope: Scope, receive: Receive, send: Send) -> None:
+        await JSONResponse(
+            status_code=413,
+            content={"detail": "Upload is too large"},
+        )(scope, receive, send)
+
+
+class RegistrationClaimMiddleware:
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if (
+            scope["type"] == "http"
+            and scope.get("method") == "POST"
+            and scope.get("path") == "/api/auth/register"
+        ):
+            request = Request(scope)
+            now = datetime.now(timezone.utc)
+            remote_addr = (
+                request.client.host if request.client is not None else "unknown"
+            )
+            try:
+                claimed = request.app.state.repository.claim_registration_submission(
+                    remote_addr=remote_addr,
+                    since=now - REGISTRATION_WINDOW,
+                    limit=REGISTRATION_LIMIT,
+                    now=now,
+                )
+            except Exception:
+                await JSONResponse(
+                    status_code=503,
+                    content={"detail": "Registration is temporarily unavailable"},
+                )(scope, receive, send)
+                return
+            if not claimed:
+                await JSONResponse(
+                    status_code=429,
+                    content={"detail": "Too many registration attempts"},
+                )(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
 
 
 def _validate_cloud_config(config: CloudConfig) -> None:
@@ -61,31 +178,8 @@ def create_cloud_app(config: CloudConfig, database: Database) -> FastAPI:
         token_service.generate_session_token()
     )
 
-    @application.middleware("http")
-    async def claim_registration_submission(request: Request, call_next):
-        if request.method == "POST" and request.url.path == "/api/auth/register":
-            now = datetime.now(timezone.utc)
-            remote_addr = (
-                request.client.host if request.client is not None else "unknown"
-            )
-            try:
-                claimed = repository.claim_registration_submission(
-                    remote_addr=remote_addr,
-                    since=now - REGISTRATION_WINDOW,
-                    limit=REGISTRATION_LIMIT,
-                    now=now,
-                )
-            except Exception:
-                return JSONResponse(
-                    status_code=503,
-                    content={"detail": "Registration is temporarily unavailable"},
-                )
-            if not claimed:
-                return JSONResponse(
-                    status_code=429,
-                    content={"detail": "Too many registration attempts"},
-                )
-        return await call_next(request)
+    application.add_middleware(RegistrationClaimMiddleware)
+    application.add_middleware(UploadGuardMiddleware)
 
     @application.exception_handler(RequestValidationError)
     async def handle_validation_error(

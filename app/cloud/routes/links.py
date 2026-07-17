@@ -37,6 +37,29 @@ def _repository(request: Request) -> CloudRepository:
     return request.app.state.repository
 
 
+def _normalize_links(data: Any, hidden_dkeys: set[str]) -> Any:
+    wrapper_key = None
+    items = data
+    if isinstance(data, dict):
+        for key in ("data", "list"):
+            if isinstance(data.get(key), list):
+                wrapper_key = key
+                items = data[key]
+                break
+
+    if not isinstance(items, list):
+        return data
+
+    normalized = [
+        with_tmp_source(item)
+        for item in items
+        if isinstance(item, dict) and item.get("dkey") not in hidden_dkeys
+    ]
+    if wrapper_key is None:
+        return normalized
+    return {**data, wrapper_key: normalized}
+
+
 @router.get("")
 async def links(
     request: Request,
@@ -52,14 +75,8 @@ async def links(
         link.dkey
         for link in _repository(request).list_automatic_download_links(user.id)
     }
-    data = result.data
-    if isinstance(data, list):
-        data = [
-            item
-            for item in data
-            if not isinstance(item, dict) or item.get("dkey") not in hidden_dkeys
-        ]
-    return result_envelope(result, data=with_tmp_source(data))
+    data = _normalize_links(result.data, hidden_dkeys)
+    return result_envelope(result, data=data)
 
 
 @router.post("")

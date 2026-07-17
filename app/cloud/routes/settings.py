@@ -11,7 +11,7 @@ from app.cloud.repository import (
     UserSettings,
 )
 from app.cloud.tmp_service import active_user_with_csrf, call_tmp, result_envelope
-from app.config import SettingsStore
+from app.config import validate_domain
 
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
@@ -55,7 +55,7 @@ def put_settings(
     user: User = Depends(active_user_with_csrf),
 ) -> dict[str, bool | str]:
     try:
-        custom_domain = SettingsStore._validate_domain(payload.custom_domain)
+        custom_domain = validate_domain(payload.custom_domain)
     except ValueError:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,

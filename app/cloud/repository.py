@@ -780,28 +780,31 @@ class CloudRepository:
         now: datetime | None = None,
     ) -> UserSettings:
         timestamp = _serialize_datetime(now or _now())
+        preserve_tmp_key = tmp_key is None
+        encrypted_tmp_key = (
+            self._key_cipher.encrypt(tmp_key) if tmp_key else ""
+        )
         with closing(self._database.connection()) as connection, connection:
-            current = connection.execute(
-                "SELECT encrypted_tmp_key FROM user_settings WHERE user_id = ?",
-                (user_id,),
-            ).fetchone()
-            if tmp_key is None:
-                encrypted_tmp_key = current[0] if current is not None else ""
-            elif tmp_key:
-                encrypted_tmp_key = self._key_cipher.encrypt(tmp_key)
-            else:
-                encrypted_tmp_key = ""
             connection.execute(
                 """
                 INSERT INTO user_settings (
                     user_id, encrypted_tmp_key, custom_domain, updated_at
                 ) VALUES (?, ?, ?, ?)
                 ON CONFLICT(user_id) DO UPDATE SET
-                    encrypted_tmp_key = excluded.encrypted_tmp_key,
+                    encrypted_tmp_key = CASE WHEN ?
+                        THEN user_settings.encrypted_tmp_key
+                        ELSE excluded.encrypted_tmp_key
+                    END,
                     custom_domain = excluded.custom_domain,
                     updated_at = excluded.updated_at
                 """,
-                (user_id, encrypted_tmp_key, custom_domain, timestamp),
+                (
+                    user_id,
+                    encrypted_tmp_key,
+                    custom_domain,
+                    timestamp,
+                    preserve_tmp_key,
+                ),
             )
             row = connection.execute(
                 "SELECT * FROM user_settings WHERE user_id = ?", (user_id,)
@@ -959,6 +962,110 @@ class CloudRepository:
                 """,
                 (user_id, dkey),
             ).fetchone()
+        return _automatic_link_from_row(row)
+
+    def try_claim_automatic_download(
+        self,
+        user_id: str,
+        *,
+        ukey: str,
+        claim_token: str,
+        expires_at: datetime,
+        now: datetime | None = None,
+    ) -> bool:
+        serialized_now = _serialize_datetime(now or _now())
+        with closing(self._database.connection()) as connection, connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO automatic_download_claims (
+                    user_id, ukey, claim_token, expires_at
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(user_id, ukey) DO UPDATE SET
+                    claim_token = excluded.claim_token,
+                    expires_at = excluded.expires_at
+                WHERE automatic_download_claims.expires_at <= ?
+                """,
+                (
+                    user_id,
+                    ukey,
+                    claim_token,
+                    _serialize_datetime(expires_at),
+                    serialized_now,
+                ),
+            )
+        return cursor.rowcount == 1
+
+    def release_automatic_download_claim(
+        self,
+        user_id: str,
+        *,
+        ukey: str,
+        claim_token: str,
+    ) -> bool:
+        with closing(self._database.connection()) as connection, connection:
+            cursor = connection.execute(
+                """
+                DELETE FROM automatic_download_claims
+                WHERE user_id = ? AND ukey = ? AND claim_token = ?
+                """,
+                (user_id, ukey, claim_token),
+            )
+        return cursor.rowcount == 1
+
+    def complete_automatic_download_claim(
+        self,
+        user_id: str,
+        *,
+        ukey: str,
+        claim_token: str,
+        dkey: str,
+        link: str,
+        expires_at: datetime | None,
+    ) -> AutomaticDownloadLink | None:
+        link_id = str(uuid4())
+        with closing(self._database.connection()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = connection.execute(
+                    """
+                    DELETE FROM automatic_download_claims
+                    WHERE user_id = ? AND ukey = ? AND claim_token = ?
+                    """,
+                    (user_id, ukey, claim_token),
+                )
+                if cursor.rowcount != 1:
+                    connection.rollback()
+                    return None
+                connection.execute(
+                    """
+                    INSERT INTO automatic_download_links (
+                        id, user_id, ukey, dkey, link, expires_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(user_id, dkey) DO UPDATE SET
+                        ukey = excluded.ukey,
+                        link = excluded.link,
+                        expires_at = excluded.expires_at
+                    """,
+                    (
+                        link_id,
+                        user_id,
+                        ukey,
+                        dkey,
+                        link,
+                        _serialize_datetime(expires_at) if expires_at else None,
+                    ),
+                )
+                row = connection.execute(
+                    """
+                    SELECT * FROM automatic_download_links
+                    WHERE user_id = ? AND dkey = ?
+                    """,
+                    (user_id, dkey),
+                ).fetchone()
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
         return _automatic_link_from_row(row)
 
     def get_automatic_download_link(

@@ -1,14 +1,20 @@
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
 from dataclasses import dataclass
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import BinaryIO
+from stat import S_IMODE
+from typing import Any, BinaryIO
 
+import httpx
 import pytest
 from cryptography.fernet import Fernet
 from fastapi.testclient import TestClient
 
+import app.cloud.routes.tmp_files as tmp_files_routes
 from app.client import TmpLinkBusinessError
 from app.cloud.app import create_cloud_app
 from app.cloud.config import CloudConfig
@@ -66,6 +72,12 @@ class FakeTmpClient:
 
     async def create_download_link(self, ukey: str):
         self._call("create_download_link", ukey)
+        started = self._remote.download_started.get(self._api_key)
+        if started is not None:
+            started.set()
+        release = self._remote.download_release.get(self._api_key)
+        if release is not None:
+            await release.wait()
         data = self._remote.downloads.get(
             self._api_key,
             {"dkey": f"AUTO-{self._api_key}", "link": f"https://tmp/{self._api_key}"},
@@ -88,6 +100,13 @@ class FakeTmpClient:
         content_type: str = "application/octet-stream",
     ):
         self._call("upload_file", file_name, model, content_type, type(file))
+        staged_path = Path(file.name)
+        self._remote.upload_permissions.append(
+            (
+                S_IMODE(staged_path.parent.stat().st_mode),
+                S_IMODE(staged_path.stat().st_mode),
+            )
+        )
         chunks: list[bytes] = []
         while chunk := file.read(2):
             chunks.append(chunk)
@@ -102,10 +121,13 @@ class RecordingRemote:
         self.factory_keys: list[str] = []
         self.calls: list[tuple] = []
         self.uploads: list[tuple[str, str, int, str, bytes]] = []
+        self.upload_permissions: list[tuple[int, int]] = []
         self.files: dict[str, list[dict]] = {}
-        self.links: dict[str, list[dict]] = {}
-        self.downloads: dict[str, dict] = {}
-        self.errors: dict[tuple[str, str], Exception] = {}
+        self.links: dict[str, Any] = {}
+        self.downloads: dict[str, Any] = {}
+        self.errors: dict[tuple[str, str], BaseException] = {}
+        self.download_started: dict[str, asyncio.Event] = {}
+        self.download_release: dict[str, asyncio.Event] = {}
 
     def factory(self, api_key: str) -> FakeTmpClient:
         self.factory_keys.append(api_key)
@@ -161,11 +183,18 @@ def cloud_app(config: CloudConfig, database: Database, remote: RecordingRemote):
 def make_tenant(cloud_app):
     clients: list[TestClient] = []
 
-    def create(username: str, key: str, *, must_change_password: bool = False) -> Tenant:
-        repository = cloud_app.state.repository
+    def create(
+        username: str,
+        key: str,
+        *,
+        must_change_password: bool = False,
+        application=None,
+    ) -> Tenant:
+        application = application or cloud_app
+        repository = application.state.repository
         user = repository.create_user(
             username,
-            cloud_app.state.password_service.hash("tenant password"),
+            application.state.password_service.hash("tenant password"),
             must_change_password=must_change_password,
             now=NOW,
         )
@@ -179,7 +208,7 @@ def make_tenant(cloud_app):
             expires_at=NOW + timedelta(days=1),
             now=NOW,
         )
-        client = TestClient(cloud_app, base_url=PUBLIC_ORIGIN)
+        client = TestClient(application, base_url=PUBLIC_ORIGIN)
         client.cookies.set(
             "session",
             session_token,
@@ -193,6 +222,84 @@ def make_tenant(cloud_app):
 
     for client in clients:
         client.close()
+
+
+def limited_cloud_app(
+    config: CloudConfig,
+    database: Database,
+    remote: RecordingRemote,
+    *,
+    max_file_bytes: int,
+):
+    application = create_cloud_app(
+        replace(config, max_file_bytes=max_file_bytes),
+        database,
+    )
+    application.state.tmp_client_factory = remote.factory
+    return application
+
+
+def multipart_body(content: bytes, filename: str = "upload.bin") -> tuple[bytes, str]:
+    boundary = "task-five-boundary"
+    body = (
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
+        "Content-Type: application/octet-stream\r\n\r\n"
+    ).encode("ascii") + content + f"\r\n--{boundary}--\r\n".encode("ascii")
+    return body, f"multipart/form-data; boundary={boundary}"
+
+
+async def invoke_asgi_upload(
+    application,
+    *,
+    headers: dict[str, str],
+    body_chunks: list[bytes],
+) -> tuple[int, bytes, int]:
+    receive_calls = 0
+    pending = list(body_chunks)
+    sent: list[dict[str, Any]] = []
+
+    async def receive() -> dict[str, Any]:
+        nonlocal receive_calls
+        receive_calls += 1
+        if pending:
+            body = pending.pop(0)
+            return {
+                "type": "http.request",
+                "body": body,
+                "more_body": bool(pending),
+            }
+        return {"type": "http.disconnect"}
+
+    async def send(message: dict[str, Any]) -> None:
+        sent.append(message)
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "https",
+        "path": "/api/uploads",
+        "raw_path": b"/api/uploads",
+        "query_string": b"",
+        "root_path": "",
+        "headers": [
+            (name.lower().encode("latin-1"), value.encode("latin-1"))
+            for name, value in headers.items()
+        ],
+        "client": ("198.51.100.25", 50000),
+        "server": ("cloud.example.com", 443),
+        "app": application,
+    }
+    await application(scope, receive, send)
+    start = next(message for message in sent if message["type"] == "http.response.start")
+    response_body = b"".join(
+        message.get("body", b"")
+        for message in sent
+        if message["type"] == "http.response.body"
+    )
+    return start["status"], response_body, receive_calls
 
 
 def test_settings_encrypt_key_preserve_empty_update_and_clear_explicitly(
@@ -281,6 +388,123 @@ def test_get_routes_require_active_user_and_every_mutation_requires_origin_and_c
     assert remote.calls == []
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("case", "expected_status"),
+    [("unauthenticated", 401), ("bad-csrf", 403), ("forced-password", 403)],
+)
+async def test_upload_guard_rejects_before_reading_the_request_body(
+    case: str,
+    expected_status: int,
+    config: CloudConfig,
+    make_tenant,
+    remote: RecordingRemote,
+):
+    tenant = make_tenant(
+        f"guard-{case}",
+        f"guard-key-{case}",
+        must_change_password=case == "forced-password",
+    )
+    body, content_type = multipart_body(b"must-not-be-read")
+    headers = {
+        "Content-Type": content_type,
+        "Content-Length": str(len(body)),
+        "X-Forwarded-For": "127.0.0.1",
+    }
+    if case != "unauthenticated":
+        headers["Cookie"] = f"session=session-guard-{case}"
+        headers["Origin"] = PUBLIC_ORIGIN
+        headers["X-CSRF-Token"] = (
+            "wrong-csrf" if case == "bad-csrf" else tenant.csrf_token
+        )
+
+    status_code, _, receive_calls = await invoke_asgi_upload(
+        tenant.client.app,
+        headers=headers,
+        body_chunks=[body],
+    )
+
+    assert status_code == expected_status
+    assert receive_calls == 0
+    assert remote.calls == []
+    assert config.storage_path is not None
+    staging = config.storage_path / ".tmp-link-staging"
+    assert not staging.exists() or list(staging.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_upload_guard_rejects_an_obviously_large_content_length_without_receiving(
+    config: CloudConfig,
+    database: Database,
+    make_tenant,
+    remote: RecordingRemote,
+):
+    application = limited_cloud_app(
+        config,
+        database,
+        remote,
+        max_file_bytes=3,
+    )
+    tenant = make_tenant(
+        "content-length-guard",
+        "content-length-key",
+        application=application,
+    )
+    body, content_type = multipart_body(b"abc")
+    status_code, _, receive_calls = await invoke_asgi_upload(
+        application,
+        headers={
+            **tenant.csrf_headers,
+            "Cookie": "session=session-content-length-guard",
+            "Content-Type": content_type,
+            "Content-Length": "1000000",
+        },
+        body_chunks=[body],
+    )
+
+    assert status_code == 413
+    assert receive_calls == 0
+    assert remote.calls == []
+
+
+@pytest.mark.asyncio
+async def test_upload_guard_caps_chunked_multipart_before_unbounded_parsing(
+    config: CloudConfig,
+    database: Database,
+    make_tenant,
+    remote: RecordingRemote,
+):
+    application = limited_cloud_app(
+        config,
+        database,
+        remote,
+        max_file_bytes=3,
+    )
+    tenant = make_tenant(
+        "chunked-upload-guard",
+        "chunked-upload-key",
+        application=application,
+    )
+    body, content_type = multipart_body(b"x" * (70 * 1024))
+
+    status_code, _, receive_calls = await invoke_asgi_upload(
+        application,
+        headers={
+            **tenant.csrf_headers,
+            "Cookie": "session=session-chunked-upload-guard",
+            "Content-Type": content_type,
+        },
+        body_chunks=[body[:1024], body[1024:]],
+    )
+
+    assert status_code == 413
+    assert receive_calls > 0
+    assert remote.calls == []
+    assert application.state.config.storage_path is not None
+    staging = application.state.config.storage_path / ".tmp-link-staging"
+    assert not staging.exists() or list(staging.iterdir()) == []
+
+
 def test_each_remote_request_builds_a_fresh_client_with_only_the_active_users_key(
     make_tenant, remote: RecordingRemote
 ):
@@ -365,6 +589,93 @@ def test_cloud_upload_defaults_to_three_days_rejects_99_and_cleans_staging(
     assert not staging.exists() or list(staging.iterdir()) == []
 
 
+def test_cloud_upload_enforces_exact_file_limit_normalizes_name_and_permissions(
+    config: CloudConfig,
+    database: Database,
+    make_tenant,
+    remote: RecordingRemote,
+):
+    application = limited_cloud_app(
+        config,
+        database,
+        remote,
+        max_file_bytes=3,
+    )
+    tenant = make_tenant(
+        "bounded-staging-upload",
+        "bounded-staging-key",
+        application=application,
+    )
+
+    accepted = tenant.client.post(
+        "/api/uploads",
+        files={"file": ("../../report.txt", b"abc", "text/plain")},
+        headers=tenant.csrf_headers,
+    )
+    rejected = tenant.client.post(
+        "/api/uploads",
+        files={"file": ("too-large.txt", b"abcd", "text/plain")},
+        headers=tenant.csrf_headers,
+    )
+
+    assert accepted.status_code == 200
+    assert rejected.status_code == 413
+    assert remote.uploads == [
+        (tenant.key, "report.txt", 2, "text/plain", b"abc")
+    ]
+    assert remote.upload_permissions == [(0o700, 0o600)]
+    assert application.state.config.storage_path is not None
+    staging = application.state.config.storage_path / ".tmp-link-staging"
+    assert staging.is_dir()
+    assert list(staging.iterdir()) == []
+
+
+def test_upload_remote_failure_cleans_staging(
+    config: CloudConfig,
+    make_tenant,
+    remote: RecordingRemote,
+):
+    tenant = make_tenant("failed-upload", "failed-upload-key")
+    remote.errors[(tenant.key, "upload_file")] = TmpLinkBusinessError(
+        "remote failure with https://private.example/file"
+    )
+
+    response = tenant.client.post(
+        "/api/uploads",
+        files={"file": ("failed.txt", b"content", "text/plain")},
+        headers=tenant.csrf_headers,
+    )
+
+    assert response.status_code == 502
+    assert config.storage_path is not None
+    staging = config.storage_path / ".tmp-link-staging"
+    assert staging.is_dir()
+    assert list(staging.iterdir()) == []
+
+
+def test_upload_cancellation_cleans_staging(
+    config: CloudConfig,
+    make_tenant,
+    remote: RecordingRemote,
+):
+    tenant = make_tenant("cancelled-upload", "cancelled-upload-key")
+    remote.errors[(tenant.key, "upload_file")] = asyncio.CancelledError()
+
+    # TestClient maps task cancellation to concurrent.futures.CancelledError on
+    # Python 3.10, while newer stacks may preserve asyncio.CancelledError.
+    with pytest.raises((asyncio.CancelledError, concurrent.futures.CancelledError)):
+        tenant.client.post(
+            "/api/uploads",
+            files={"file": ("cancelled.txt", b"content", "text/plain")},
+            headers=tenant.csrf_headers,
+        )
+
+    assert config.storage_path is not None
+    staging = config.storage_path / ".tmp-link-staging"
+    assert staging.is_dir()
+    assert list(staging.iterdir()) == []
+
+
 def test_automatic_downloads_are_reused_and_hidden_only_for_their_tenant(
     cloud_app, make_tenant, remote: RecordingRemote
 ):
@@ -425,6 +736,265 @@ def test_automatic_downloads_are_reused_and_hidden_only_for_their_tenant(
     assert repository.list_automatic_download_links(
         first.id, ukey="OTHER-UKEY"
     ) == []
+
+
+@pytest.mark.asyncio
+async def test_concurrent_downloads_across_app_instances_create_one_remote_link(
+    cloud_app,
+    config: CloudConfig,
+    database: Database,
+    make_tenant,
+    remote: RecordingRemote,
+):
+    tenant = make_tenant("concurrent-download", "concurrent-download-key")
+    second_application = create_cloud_app(config, Database(database.path))
+    second_application.state.tmp_client_factory = remote.factory
+    started = asyncio.Event()
+    release = asyncio.Event()
+    remote.download_started[tenant.key] = started
+    remote.download_release[tenant.key] = release
+    headers = {
+        **tenant.csrf_headers,
+        "Cookie": "session=session-concurrent-download",
+    }
+
+    async with (
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=cloud_app),
+            base_url=PUBLIC_ORIGIN,
+        ) as first_client,
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=second_application),
+            base_url=PUBLIC_ORIGIN,
+        ) as second_client,
+    ):
+        first_pending = asyncio.create_task(
+            first_client.post(
+                "/api/files/SAME-UKEY/download",
+                headers=headers,
+            )
+        )
+        await asyncio.wait_for(started.wait(), timeout=2)
+        second_pending = asyncio.create_task(
+            second_client.post(
+                "/api/files/SAME-UKEY/download",
+                headers=headers,
+            )
+        )
+        await asyncio.sleep(0.1)
+        release.set()
+        first_response, second_response = await asyncio.gather(
+            first_pending,
+            second_pending,
+        )
+
+    assert first_response.status_code == 200
+    assert second_response.status_code == 200
+    assert first_response.json()["data"] == second_response.json()["data"]
+    creates = [
+        call
+        for call in remote.calls
+        if call[:3] == (tenant.key, "create_download_link", "SAME-UKEY")
+    ]
+    assert len(creates) == 1
+    with database.connection() as connection:
+        real_rows = connection.execute(
+            "SELECT COUNT(*) FROM automatic_download_links WHERE user_id = ? AND ukey = ?",
+            (tenant.id, "SAME-UKEY"),
+        ).fetchone()[0]
+        claims = connection.execute(
+            "SELECT COUNT(*) FROM automatic_download_claims WHERE user_id = ? AND ukey = ?",
+            (tenant.id, "SAME-UKEY"),
+        ).fetchone()[0]
+    assert real_rows == 1
+    assert claims == 0
+
+
+@pytest.mark.asyncio
+async def test_download_claims_for_different_users_do_not_block_each_other(
+    cloud_app,
+    make_tenant,
+    remote: RecordingRemote,
+):
+    first = make_tenant("parallel-first", "parallel-first-key")
+    second = make_tenant("parallel-second", "parallel-second-key")
+    started = asyncio.Event()
+    release = asyncio.Event()
+    remote.download_started[first.key] = started
+    remote.download_release[first.key] = release
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=cloud_app),
+        base_url=PUBLIC_ORIGIN,
+    ) as client:
+        first_pending = asyncio.create_task(
+            client.post(
+                "/api/files/FIRST-UKEY/download",
+                headers={
+                    **first.csrf_headers,
+                    "Cookie": "session=session-parallel-first",
+                },
+            )
+        )
+        await asyncio.wait_for(started.wait(), timeout=2)
+        try:
+            second_response = await asyncio.wait_for(
+                client.post(
+                    "/api/files/SECOND-UKEY/download",
+                    headers={
+                        **second.csrf_headers,
+                        "Cookie": "session=session-parallel-second",
+                    },
+                ),
+                timeout=1,
+            )
+        finally:
+            release.set()
+        first_response = await first_pending
+
+    assert first_response.status_code == 200
+    assert second_response.status_code == 200
+    assert (second.key, "create_download_link", "SECOND-UKEY") in remote.calls
+
+
+def test_failed_download_creation_releases_the_persistent_claim(
+    cloud_app,
+    database: Database,
+    make_tenant,
+    remote: RecordingRemote,
+):
+    tenant = make_tenant("failed-download", "failed-download-key")
+    remote.errors[(tenant.key, "create_download_link")] = TmpLinkBusinessError(
+        "remote create failed"
+    )
+
+    failed = tenant.client.post(
+        "/api/files/RETRY-UKEY/download",
+        headers=tenant.csrf_headers,
+    )
+    remote.errors.clear()
+    retried = tenant.client.post(
+        "/api/files/RETRY-UKEY/download",
+        headers=tenant.csrf_headers,
+    )
+
+    assert failed.status_code == 502
+    assert retried.status_code == 200
+    with database.connection() as connection:
+        claims = connection.execute(
+            "SELECT COUNT(*) FROM automatic_download_claims WHERE user_id = ? AND ukey = ?",
+            (tenant.id, "RETRY-UKEY"),
+        ).fetchone()[0]
+    assert claims == 0
+
+
+def test_download_reuses_exactly_one_hour_but_not_null_expiry(
+    cloud_app,
+    make_tenant,
+    remote: RecordingRemote,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    tenant = make_tenant("download-boundary", "download-boundary-key")
+    repository = cloud_app.state.repository
+
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return NOW if tz is not None else NOW.replace(tzinfo=None)
+
+    monkeypatch.setattr(tmp_files_routes, "datetime", FrozenDateTime)
+    repository.save_automatic_download_link(
+        tenant.id,
+        ukey="EXACT-UKEY",
+        dkey="EXACT-DKEY",
+        link="https://tmp/exact",
+        expires_at=NOW + timedelta(hours=1),
+    )
+    repository.save_automatic_download_link(
+        tenant.id,
+        ukey="NULL-UKEY",
+        dkey="NULL-DKEY",
+        link="https://tmp/null",
+        expires_at=None,
+    )
+
+    exact = tenant.client.post(
+        "/api/files/EXACT-UKEY/download",
+        headers=tenant.csrf_headers,
+    )
+    null_expiry = tenant.client.post(
+        "/api/files/NULL-UKEY/download",
+        headers=tenant.csrf_headers,
+    )
+
+    assert exact.json()["data"]["dkey"] == "EXACT-DKEY"
+    assert null_expiry.json()["data"]["dkey"] != "NULL-DKEY"
+    assert [
+        call
+        for call in remote.calls
+        if call[1] == "create_download_link"
+    ] == [(tenant.key, "create_download_link", "NULL-UKEY")]
+
+
+@pytest.mark.parametrize("items_key", ["data", "list"])
+def test_wrapped_remote_links_filter_actual_items_and_preserve_wrapper_metadata(
+    items_key: str,
+    cloud_app,
+    make_tenant,
+    remote: RecordingRemote,
+):
+    first = make_tenant(f"wrapped-first-{items_key}", f"wrapped-first-key-{items_key}")
+    second = make_tenant(
+        f"wrapped-second-{items_key}",
+        f"wrapped-second-key-{items_key}",
+    )
+    repository = cloud_app.state.repository
+    repository.save_automatic_download_link(
+        first.id,
+        ukey="FIRST-UKEY",
+        dkey="FIRST-HIDDEN",
+        link="https://tmp/first-hidden",
+        expires_at=NOW + timedelta(hours=24),
+    )
+    repository.save_automatic_download_link(
+        second.id,
+        ukey="SECOND-UKEY",
+        dkey="SECOND-VISIBLE",
+        link="https://tmp/second-visible",
+        expires_at=NOW + timedelta(hours=24),
+    )
+    remote.links[first.key] = {
+        items_key: [
+            {"dkey": "FIRST-HIDDEN", "link": "https://tmp/first-hidden"},
+            {"dkey": "SECOND-VISIBLE", "link": "https://tmp/second-visible"},
+            "invalid-item",
+            {"dkey": "MANUAL", "link": "https://tmp/manual"},
+        ],
+        "page": 3,
+        "total": 4,
+    }
+
+    response = first.client.get("/api/links?page=3")
+
+    assert response.status_code == 200
+    wrapper = response.json()["data"]
+    assert wrapper == {
+        items_key: [
+            {
+                "dkey": "SECOND-VISIBLE",
+                "link": "https://tmp/second-visible",
+                "source": "tmp",
+            },
+            {
+                "dkey": "MANUAL",
+                "link": "https://tmp/manual",
+                "source": "tmp",
+            },
+        ],
+        "page": 3,
+        "total": 4,
+    }
+    assert "source" not in wrapper
 
 
 def test_manual_links_stay_visible_and_cross_tenant_deletes_do_not_remove_auto_rows(

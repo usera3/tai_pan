@@ -5,7 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import is_dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from threading import Barrier
+from threading import Barrier, Event, get_ident
 
 import pytest
 from cryptography.fernet import Fernet
@@ -410,6 +410,107 @@ def test_settings_encrypt_tmp_key_and_expose_only_configuration_status(
     assert encrypted not in repr(settings)
 
 
+def test_empty_key_save_does_not_select_and_rewrite_the_old_ciphertext(
+    repository: CloudRepository,
+    database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    user = create_user(repository, "atomic-settings-query")
+    repository.save_user_settings(user.id, tmp_key="old-key", now=NOW)
+    queries: list[tuple[str, object]] = []
+    original_connection = database.connection
+    monkeypatch.setattr(
+        database,
+        "connection",
+        lambda: RecordingConnection(original_connection(), queries),
+    )
+
+    repository.save_user_settings(
+        user.id,
+        tmp_key=None,
+        custom_domain="files.example.com",
+        now=NOW + timedelta(seconds=1),
+    )
+
+    assert not any(
+        "SELECT encrypted_tmp_key FROM user_settings" in query
+        for query, _ in queries
+    )
+    assert repository.get_tmp_key(user.id) == "old-key"
+
+
+def test_empty_key_save_cannot_restore_a_key_cleared_concurrently(
+    repository: CloudRepository,
+    database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    user = create_user(repository, "atomic-settings-race")
+    repository.save_user_settings(user.id, tmp_key="must-stay-cleared", now=NOW)
+    ready = Event()
+    resume = Event()
+    worker_ids: list[int] = []
+    original_connection = database.connection
+
+    class ControlledSettingsConnection:
+        def __init__(self, connection: sqlite3.Connection):
+            self._connection = connection
+            self._paused = False
+
+        def __enter__(self):
+            self._connection.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self._connection.__exit__(*args)
+
+        def close(self) -> None:
+            self._connection.close()
+
+        def execute(self, query: str, parameters=()):
+            is_worker = bool(worker_ids) and get_ident() == worker_ids[0]
+            selects_old_key = "SELECT encrypted_tmp_key FROM user_settings" in query
+            atomic_upsert = (
+                "INSERT INTO user_settings" in query
+                and "ON CONFLICT(user_id) DO UPDATE" in query
+            )
+            if is_worker and selects_old_key:
+                cursor = self._connection.execute(query, parameters)
+                self._paused = True
+                ready.set()
+                assert resume.wait(timeout=2)
+                return cursor
+            if is_worker and atomic_upsert and not self._paused:
+                self._paused = True
+                ready.set()
+                assert resume.wait(timeout=2)
+            return self._connection.execute(query, parameters)
+
+    monkeypatch.setattr(
+        database,
+        "connection",
+        lambda: ControlledSettingsConnection(original_connection()),
+    )
+
+    def preserve_key():
+        worker_ids.append(get_ident())
+        return repository.save_user_settings(
+            user.id,
+            tmp_key=None,
+            custom_domain="cdn.example.com",
+            now=NOW + timedelta(seconds=1),
+        )
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        pending = executor.submit(preserve_key)
+        assert ready.wait(timeout=2)
+        repository.clear_tmp_key(user.id, now=NOW + timedelta(seconds=2))
+        resume.set()
+        saved = pending.result(timeout=2)
+
+    assert saved.key_configured is False
+    assert repository.get_tmp_key(user.id) is None
+
+
 def test_file_queries_and_mutations_are_user_scoped(repository: CloudRepository):
     owner = create_user(repository, "file-owner")
     other = create_user(repository, "file-other")
@@ -536,6 +637,87 @@ def test_automatic_links_are_user_scoped_and_filter_by_source_and_expiry(
         owner.id, ukey="source-a", active_at=NOW
     ) == [active]
     assert repository.list_automatic_download_links(other.id, active_at=NOW) == []
+
+
+def test_automatic_download_claims_are_atomic_expirable_and_releasable(
+    repository: CloudRepository,
+    database: Database,
+):
+    user = create_user(repository, "claim-owner")
+    competing_repository = CloudRepository(
+        database,
+        KeyCipher(Fernet.generate_key()),
+    )
+    first_expiry = NOW + timedelta(minutes=1)
+
+    assert repository.try_claim_automatic_download(
+        user.id,
+        ukey="SAME-UKEY",
+        claim_token="first-token",
+        expires_at=first_expiry,
+        now=NOW,
+    )
+    assert not competing_repository.try_claim_automatic_download(
+        user.id,
+        ukey="SAME-UKEY",
+        claim_token="second-token",
+        expires_at=first_expiry + timedelta(minutes=1),
+        now=first_expiry - timedelta(microseconds=1),
+    )
+    assert competing_repository.try_claim_automatic_download(
+        user.id,
+        ukey="SAME-UKEY",
+        claim_token="second-token",
+        expires_at=first_expiry + timedelta(minutes=1),
+        now=first_expiry,
+    )
+    assert not repository.release_automatic_download_claim(
+        user.id,
+        ukey="SAME-UKEY",
+        claim_token="first-token",
+    )
+    assert competing_repository.release_automatic_download_claim(
+        user.id,
+        ukey="SAME-UKEY",
+        claim_token="second-token",
+    )
+
+
+def test_completing_a_claim_atomically_replaces_it_with_one_real_link(
+    repository: CloudRepository,
+    database: Database,
+):
+    user = create_user(repository, "claim-completion")
+    assert repository.try_claim_automatic_download(
+        user.id,
+        ukey="CLAIMED-UKEY",
+        claim_token="winner-token",
+        expires_at=NOW + timedelta(minutes=1),
+        now=NOW,
+    )
+
+    link = repository.complete_automatic_download_claim(
+        user.id,
+        ukey="CLAIMED-UKEY",
+        claim_token="winner-token",
+        dkey="REAL-DKEY",
+        link="https://files.example/real",
+        expires_at=NOW + timedelta(hours=24),
+    )
+
+    assert link is not None
+    assert link.dkey == "REAL-DKEY"
+    with database.connection() as connection:
+        claim_count = connection.execute(
+            "SELECT COUNT(*) FROM automatic_download_claims WHERE user_id = ?",
+            (user.id,),
+        ).fetchone()[0]
+        link_count = connection.execute(
+            "SELECT COUNT(*) FROM automatic_download_links WHERE user_id = ? AND ukey = ?",
+            (user.id, "CLAIMED-UKEY"),
+        ).fetchone()[0]
+    assert claim_count == 0
+    assert link_count == 1
 
 
 def test_audit_events_and_rate_limit_attempts_return_typed_records(

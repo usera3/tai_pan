@@ -5,7 +5,7 @@ from pathlib import Path
 
 
 BUSY_TIMEOUT_MS = 5_000
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 MIGRATIONS: tuple[tuple[str, ...], ...] = (
@@ -102,6 +102,17 @@ MIGRATIONS: tuple[tuple[str, ...], ...] = (
         "CREATE INDEX cloud_files_user_id_idx ON cloud_files(user_id)",
         "CREATE INDEX audit_events_user_id_idx ON audit_events(user_id)",
         "CREATE INDEX auth_attempts_created_at_idx ON auth_attempts(created_at)",
+    ),
+    (
+        """
+        CREATE TABLE automatic_download_claims (
+            user_id TEXT NOT NULL REFERENCES users(id),
+            ukey TEXT NOT NULL,
+            claim_token TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            UNIQUE (user_id, ukey)
+        )
+        """,
     ),
 )
 
