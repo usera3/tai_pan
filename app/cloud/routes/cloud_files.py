@@ -11,6 +11,7 @@ from app.cloud.storage import (
     InsufficientStorage,
     StorageForbidden,
     StorageQuotaExceeded,
+    safe_content_type,
 )
 
 
@@ -67,7 +68,7 @@ def download_cloud_file(request: Request, user: User, file_id: str) -> Response:
     return Response(
         content=b"",
         status_code=status.HTTP_200_OK,
-        media_type=download.file.content_type,
+        media_type=safe_content_type(download.file.content_type),
         headers={
             "X-Accel-Redirect": download.accel_redirect,
             "Content-Disposition": download.content_disposition,

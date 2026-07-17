@@ -201,8 +201,14 @@ def test_cloud_download_is_owner_only_uses_accel_redirect_and_safe_unicode_heade
     uploaded = cloud_upload(owner, "../safe-\u6d4b\u8bd5.txt", b"abc").json()["data"]
     with cloud_app.state.database.connection() as connection:
         connection.execute(
-            "UPDATE cloud_files SET original_name = ? WHERE id = ?",
-            ("safe-\u6d4b\u8bd5\r\n.txt", uploaded["id"]),
+            """
+            UPDATE cloud_files SET original_name = ?, content_type = ? WHERE id = ?
+            """,
+            (
+                "safe-\u6d4b\u8bd5\r\n.txt",
+                "text/plain\r\nX-Injected: unsafe",
+                uploaded["id"],
+            ),
         )
     path = f"/api/files/{uploaded['id']}/download?source=cloud"
 
@@ -210,6 +216,8 @@ def test_cloud_download_is_owner_only_uses_accel_redirect_and_safe_unicode_heade
 
     assert response.status_code == 200
     assert response.content == b""
+    assert response.headers["content-type"] == "application/octet-stream"
+    assert "x-injected" not in response.headers
     assert response.headers["x-accel-redirect"].startswith(
         f"/_protected_files/users/{owner.id}/"
     )
@@ -268,6 +276,34 @@ def test_cloud_delete_cleans_metadata_when_disk_is_missing_and_then_returns_same
         ("cloud_file_deleted", uploaded["id"])
     ]
     assert str(storage_root) not in deleted.text + repr(events)
+
+
+def test_cloud_delete_denies_other_user_and_admin_while_disk_file_is_present(
+    cloud_app, make_tenant
+):
+    owner = make_tenant("delete-present-owner")
+    other = make_tenant("delete-present-other")
+    admin = make_tenant("delete-present-admin", role="admin")
+    uploaded = cloud_upload(owner, "private.txt", b"private").json()["data"]
+    record = cloud_app.state.repository.get_cloud_file(owner.id, uploaded["id"])
+    assert record is not None
+    storage_root = cloud_app.state.config.storage_path
+    assert storage_root is not None
+    stored_path = storage_root.joinpath(*PurePosixPath(record.storage_path).parts)
+    path = f"/api/files/{uploaded['id']}?source=cloud"
+
+    denied = [
+        other.client.delete(path, headers=other.headers),
+        admin.client.delete(path, headers=admin.headers),
+    ]
+
+    assert [response.status_code for response in denied] == [403, 403]
+    assert denied[0].text == denied[1].text
+    assert stored_path.read_bytes() == b"private"
+    assert (
+        cloud_app.state.repository.get_cloud_file(owner.id, uploaded["id"]) == record
+    )
+    assert cloud_app.state.repository.list_audit_events(owner.id) == []
 
 
 def test_identifier_shape_never_selects_storage_backend(cloud_app, make_tenant):
