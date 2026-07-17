@@ -1097,6 +1097,47 @@ def test_initial_admin_bootstrap_refuses_symlink_parent(tmp_path: Path):
         ).fetchone()[0] == 0
 
 
+def test_initial_admin_bootstrap_refuses_symlink_ancestor(tmp_path: Path):
+    from app.cloud.admin_cli import BootstrapError, bootstrap_initial_admin
+
+    database = Database(tmp_path / "bootstrap.db")
+    real_parent = tmp_path / "real-parent"
+    nested_parent = real_parent / "nested"
+    nested_parent.mkdir(parents=True)
+    symlink_ancestor = tmp_path / "ancestor-link"
+    symlink_ancestor.symlink_to(real_parent, target_is_directory=True)
+
+    with pytest.raises(BootstrapError):
+        bootstrap_initial_admin(
+            database=database,
+            username="bootstrap-admin",
+            credentials_file=symlink_ancestor / "nested" / "credentials.json",
+        )
+
+    assert not (nested_parent / "credentials.json").exists()
+    assert not (nested_parent / ".credentials.json.pending").exists()
+
+
+def test_initial_admin_bootstrap_refuses_group_writable_credentials_directory(
+    tmp_path: Path,
+):
+    from app.cloud.admin_cli import BootstrapError, bootstrap_initial_admin
+
+    database = Database(tmp_path / "bootstrap.db")
+    unsafe_parent = tmp_path / "unsafe-parent"
+    unsafe_parent.mkdir(mode=0o770)
+    unsafe_parent.chmod(0o770)
+
+    with pytest.raises(BootstrapError):
+        bootstrap_initial_admin(
+            database=database,
+            username="bootstrap-admin",
+            credentials_file=unsafe_parent / "credentials.json",
+        )
+
+    assert list(unsafe_parent.iterdir()) == []
+
+
 def test_initial_admin_bootstrap_refuses_pending_that_mismatches_existing_admin(
     tmp_path: Path,
 ):
@@ -1136,6 +1177,168 @@ def test_initial_admin_bootstrap_refuses_pending_that_mismatches_existing_admin(
     assert temporary_password not in repr(error.value)
     assert pending_path.exists()
     assert not credentials_file.exists()
+
+
+def test_initial_admin_bootstrap_never_replaces_racing_final_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    import app.cloud.admin_cli as admin_cli
+
+    database = Database(tmp_path / "bootstrap.db")
+    credentials_file = tmp_path / "racing-final.json"
+    original_link = admin_cli._link_pending_no_replace
+    sentinel = b"do-not-overwrite"
+
+    def create_final_then_link(directory_fd, pending, final_name):
+        if final_name != credentials_file.name:
+            return original_link(directory_fd, pending, final_name)
+        descriptor = os.open(
+            final_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+            dir_fd=directory_fd,
+        )
+        try:
+            os.write(descriptor, sentinel)
+        finally:
+            os.close(descriptor)
+        return original_link(directory_fd, pending, final_name)
+
+    monkeypatch.setattr(admin_cli, "_link_pending_no_replace", create_final_then_link)
+
+    with pytest.raises(admin_cli.BootstrapError):
+        admin_cli.bootstrap_initial_admin(
+            database=database,
+            username="bootstrap-admin",
+            credentials_file=credentials_file,
+        )
+
+    assert credentials_file.read_bytes() == sentinel
+    assert pending_credentials_path(credentials_file).exists()
+
+
+def test_initial_admin_bootstrap_publishes_pinned_pending_inode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    import app.cloud.admin_cli as admin_cli
+
+    database = Database(tmp_path / "bootstrap.db")
+    credentials_file = tmp_path / "pinned-pending.json"
+    replacement_target = tmp_path / "replacement-target"
+    replacement_target.write_text("attacker-controlled", encoding="utf-8")
+    original_link = admin_cli._link_pending_no_replace
+
+    def replace_name_then_link(directory_fd, pending, final_name):
+        if final_name != credentials_file.name:
+            return original_link(directory_fd, pending, final_name)
+        os.unlink(pending.name, dir_fd=directory_fd)
+        os.symlink(replacement_target, pending.name, dir_fd=directory_fd)
+        return original_link(directory_fd, pending, final_name)
+
+    monkeypatch.setattr(admin_cli, "_link_pending_no_replace", replace_name_then_link)
+
+    user_id = admin_cli.bootstrap_initial_admin(
+        database=database,
+        username="bootstrap-admin",
+        credentials_file=credentials_file,
+    )
+
+    assert user_id
+    assert not credentials_file.is_symlink()
+    credentials = json.loads(credentials_file.read_text(encoding="utf-8"))
+    assert credentials["username"] == "bootstrap-admin"
+    assert pending_credentials_path(credentials_file).is_symlink()
+    assert replacement_target.read_text(encoding="utf-8") == "attacker-controlled"
+
+
+def test_initial_admin_bootstrap_cleans_interrupted_pending_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    import app.cloud.admin_cli as admin_cli
+
+    database = Database(tmp_path / "bootstrap.db")
+    credentials_file = tmp_path / "interrupted-write.json"
+    original_fsync = os.fsync
+    interrupted = False
+
+    def interrupt_file_fsync(descriptor: int):
+        nonlocal interrupted
+        if not interrupted and stat.S_ISREG(os.fstat(descriptor).st_mode):
+            interrupted = True
+            raise KeyboardInterrupt
+        return original_fsync(descriptor)
+
+    monkeypatch.setattr(admin_cli.os, "fsync", interrupt_file_fsync)
+
+    with pytest.raises(KeyboardInterrupt):
+        admin_cli.bootstrap_initial_admin(
+            database=database,
+            username="bootstrap-admin",
+            credentials_file=credentials_file,
+        )
+
+    assert not credentials_file.exists()
+    assert not pending_credentials_path(credentials_file).exists()
+
+
+def test_initial_admin_bootstrap_keeps_pending_when_commit_verification_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    import app.cloud.admin_cli as admin_cli
+
+    database = Database(tmp_path / "bootstrap.db")
+    database.initialize()
+    credentials_file = tmp_path / "verification-error.json"
+    original_connection = database.connection
+    failed = False
+
+    class CommitThenFailConnection:
+        def __init__(self):
+            self._connection = original_connection()
+
+        def __enter__(self):
+            self._connection.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self._connection.__exit__(*args)
+
+        def close(self):
+            self._connection.close()
+
+        def commit(self):
+            nonlocal failed
+            self._connection.commit()
+            if not failed:
+                failed = True
+                raise sqlite3.OperationalError("post-commit failure")
+
+        def rollback(self):
+            self._connection.rollback()
+
+        def execute(self, query: str, parameters=()):
+            return self._connection.execute(query, parameters)
+
+    monkeypatch.setattr(database, "connection", CommitThenFailConnection)
+    monkeypatch.setattr(
+        admin_cli.PasswordService,
+        "verify",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("verification unavailable")),
+    )
+
+    with pytest.raises(admin_cli.BootstrapError):
+        admin_cli.bootstrap_initial_admin(
+            database=database,
+            username="bootstrap-admin",
+            credentials_file=credentials_file,
+        )
+
+    assert not credentials_file.exists()
+    assert pending_credentials_path(credentials_file).exists()
+    with original_connection() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM users WHERE role = 'admin'"
+        ).fetchone()[0] == 1
 
 
 def test_initial_admin_bootstrap_fsyncs_pending_then_commits_renames_and_fsyncs_parent(
@@ -1195,5 +1398,11 @@ def test_initial_admin_bootstrap_fsyncs_pending_then_commits_renames_and_fsyncs_
         credentials_file=credentials_file,
     )
 
-    assert events[:4] == ["fsync-pending", "commit", "rename", "fsync-parent"]
+    assert events[:5] == [
+        "fsync-pending",
+        "fsync-parent",
+        "commit",
+        "rename",
+        "fsync-parent",
+    ]
     assert stat.S_IMODE(credentials_file.stat().st_mode) == 0o600
