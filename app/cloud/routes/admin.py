@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.cloud.dependencies import admin_user, verify_csrf
 from app.cloud.repository import CloudRepository, Invitation, User
@@ -28,7 +28,6 @@ class AdminUserResponse(BaseModel):
 
 class AdminInvitationResponse(BaseModel):
     id: str
-    code_hash: str
     created_by: str
     created_at: datetime
     expires_at: datetime | None
@@ -43,7 +42,7 @@ class CreateInvitationRequest(BaseModel):
 
 class CreateInvitationResponse(BaseModel):
     invitation: AdminInvitationResponse
-    code: str
+    code: str = Field(repr=False)
 
 
 class UpdateUserStatusRequest(BaseModel):
@@ -52,7 +51,7 @@ class UpdateUserStatusRequest(BaseModel):
 
 class ResetPasswordResponse(BaseModel):
     user: AdminUserResponse
-    temporary_password: str
+    temporary_password: str = Field(repr=False)
 
 
 class MessageResponse(BaseModel):
@@ -74,7 +73,7 @@ def _admin_with_csrf(
     return actor
 
 
-def _user_response(repository: CloudRepository, user: User) -> AdminUserResponse:
+def _user_response(user: User, *, storage_bytes: int) -> AdminUserResponse:
     return AdminUserResponse(
         id=user.id,
         username=user.username,
@@ -84,7 +83,7 @@ def _user_response(repository: CloudRepository, user: User) -> AdminUserResponse
         created_at=user.created_at,
         updated_at=user.updated_at,
         last_login_at=user.last_login_at,
-        storage_bytes=repository.user_storage_bytes(user.id),
+        storage_bytes=storage_bytes,
     )
 
 
@@ -99,7 +98,6 @@ def _invitation_response(
         invitation_status = "available"
     return AdminInvitationResponse(
         id=invitation.id,
-        code_hash=invitation.code_hash,
         created_by=invitation.created_by,
         created_at=invitation.created_at,
         expires_at=invitation.expires_at,
@@ -130,7 +128,10 @@ def list_users(
     actor: User = Depends(admin_user),
 ) -> list[AdminUserResponse]:
     repository = _repository(request)
-    return [_user_response(repository, user) for user in repository.list_users()]
+    return [
+        _user_response(item.user, storage_bytes=item.storage_bytes)
+        for item in repository.list_users_with_storage()
+    ]
 
 
 @router.patch("/users/{user_id}", response_model=AdminUserResponse)
@@ -148,7 +149,10 @@ def update_user_status(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="User not found",
         )
-    return _user_response(repository, updated)
+    return _user_response(
+        updated,
+        storage_bytes=repository.user_storage_bytes(updated.id),
+    )
 
 
 @router.post(
@@ -174,7 +178,10 @@ def reset_user_password(
             detail="User not found",
         )
     return ResetPasswordResponse(
-        user=_user_response(repository, updated),
+        user=_user_response(
+            updated,
+            storage_bytes=repository.user_storage_bytes(updated.id),
+        ),
         temporary_password=temporary_password,
     )
 

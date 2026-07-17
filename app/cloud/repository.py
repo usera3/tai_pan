@@ -29,6 +29,12 @@ class User:
 
 
 @dataclass(frozen=True)
+class UserWithStorage:
+    user: User
+    storage_bytes: int
+
+
+@dataclass(frozen=True)
 class Invitation:
     id: str
     code_hash: str = field(repr=False)
@@ -318,6 +324,28 @@ class CloudRepository:
                 "SELECT * FROM users ORDER BY created_at, id"
             ).fetchall()
         return [_user_from_row(row) for row in rows]
+
+    def list_users_with_storage(self) -> list[UserWithStorage]:
+        with closing(self._database.connection()) as connection:
+            rows = connection.execute(
+                """
+                SELECT users.*, COALESCE(storage.storage_bytes, 0) AS storage_bytes
+                FROM users
+                LEFT JOIN (
+                    SELECT user_id, SUM(size_bytes) AS storage_bytes
+                    FROM cloud_files
+                    GROUP BY user_id
+                ) AS storage ON storage.user_id = users.id
+                ORDER BY users.created_at, users.id
+                """
+            ).fetchall()
+        return [
+            UserWithStorage(
+                user=_user_from_row(row),
+                storage_bytes=int(row["storage_bytes"]),
+            )
+            for row in rows
+        ]
 
     def set_user_status_and_revoke_sessions(
         self,

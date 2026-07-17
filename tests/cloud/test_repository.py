@@ -461,6 +461,48 @@ def test_file_quota_sums_are_aggregated_per_user_and_globally(
     assert repository.global_storage_bytes() == 750
 
 
+def test_user_storage_listing_is_typed_and_uses_one_left_join_query(
+    repository: CloudRepository,
+    database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    first = create_user(repository, "storage-list-first")
+    second = create_user(repository, "storage-list-second")
+    repository.create_cloud_file(
+        first.id,
+        original_name="first.bin",
+        content_type="application/octet-stream",
+        size_bytes=321,
+        storage_path=f"{first.id}/first.bin",
+        sha256="1" * 64,
+        now=NOW,
+    )
+    queries: list[tuple[str, object]] = []
+    original_connection = database.connection
+    monkeypatch.setattr(
+        database,
+        "connection",
+        lambda: RecordingConnection(original_connection(), queries),
+    )
+
+    listed = repository.list_users_with_storage()
+
+    assert all(is_dataclass(item) for item in listed)
+    assert {item.user.id: item.storage_bytes for item in listed} == {
+        first.id: 321,
+        second.id: 0,
+    }
+    assert [item.user.id for item in listed] == sorted((first.id, second.id))
+    selects = [
+        query
+        for query, _ in queries
+        if query.lstrip().upper().startswith("SELECT")
+    ]
+    assert len(selects) == 1
+    assert "LEFT JOIN" in selects[0].upper()
+    assert "GROUP BY" in selects[0].upper()
+
+
 def test_automatic_links_are_user_scoped_and_filter_by_source_and_expiry(
     repository: CloudRepository,
 ):

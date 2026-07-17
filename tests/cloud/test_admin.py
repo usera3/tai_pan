@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import os
 import sqlite3
 import stat
 import subprocess
@@ -64,6 +66,30 @@ def login(client: TestClient, username: str, password: str) -> str:
 
 def csrf_headers(csrf_token: str, origin: str = PUBLIC_ORIGIN) -> dict[str, str]:
     return {"Origin": origin, "X-CSRF-Token": csrf_token}
+
+
+def pending_credentials_path(credentials_file: Path) -> Path:
+    return credentials_file.with_name(f".{credentials_file.name}.pending")
+
+
+def write_pending_credentials(
+    credentials_file: Path,
+    *,
+    username: str,
+    temporary_password: str,
+) -> Path:
+    pending_path = pending_credentials_path(credentials_file)
+    pending_path.write_text(
+        json.dumps(
+            {
+                "username": username,
+                "temporary_password": temporary_password,
+            }
+        ),
+        encoding="utf-8",
+    )
+    pending_path.chmod(0o600)
+    return pending_path
 
 
 @pytest.fixture
@@ -159,6 +185,52 @@ def test_every_admin_mutation_requires_csrf_and_matching_origin(
         ).fetchone()[0] == 1
 
 
+def test_every_admin_mutation_rejects_wrong_csrf_with_correct_origin(
+    cloud_app, database: Database, admin, admin_client
+):
+    client, _ = admin_client
+    target = create_user(cloud_app, "wrong-csrf-target")
+    original_password_hash = target.password_hash
+    invitation = cloud_app.state.repository.create_invitation(
+        created_by=admin.id,
+        code="wrong-csrf-protected-invitation",
+    )
+    bad_headers = csrf_headers("wrong-csrf-token")
+
+    responses = [
+        client.post("/api/admin/invitations", headers=bad_headers, json={}),
+        client.patch(
+            f"/api/admin/users/{target.id}",
+            headers=bad_headers,
+            json={"status": "disabled"},
+        ),
+        client.post(
+            f"/api/admin/users/{target.id}/reset-password",
+            headers=bad_headers,
+        ),
+        client.delete(
+            f"/api/admin/invitations/{invitation.id}", headers=bad_headers
+        ),
+    ]
+
+    assert {response.status_code for response in responses} == {403}
+    assert all(
+        response.json() == {"detail": "CSRF validation failed"}
+        for response in responses
+    )
+    unchanged = cloud_app.state.repository.get_user(target.id)
+    assert unchanged is not None
+    assert unchanged.status == "active"
+    assert unchanged.password_hash == original_password_hash
+    with database.connection() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM invitations"
+        ).fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT COUNT(*) FROM invitations WHERE id = ?", (invitation.id,)
+        ).fetchone()[0] == 1
+
+
 def test_invitation_plaintext_is_returned_once_and_used_code_cannot_be_revoked_or_reused(
     cloud_app, database: Database, admin_client
 ):
@@ -176,8 +248,15 @@ def test_invitation_plaintext_is_returned_once_and_used_code_cannot_be_revoked_o
     invitation = body["invitation"]
     assert len(invitation_code) >= 32
     assert invitation["status"] == "available"
-    assert invitation["code_hash"] == hash_secret(invitation_code)
+    assert "code_hash" not in invitation
     assert invitation_code not in str(invitation)
+    assert created.text.count(invitation_code) == 1
+    assert hash_secret(invitation_code) not in created.text
+    from app.cloud.routes.admin import CreateInvitationResponse
+
+    response_model = CreateInvitationResponse.model_validate(body)
+    assert invitation_code not in repr(response_model)
+    assert invitation_code not in str(response_model)
 
     with database.connection() as connection:
         stored = connection.execute(
@@ -190,6 +269,7 @@ def test_invitation_plaintext_is_returned_once_and_used_code_cannot_be_revoked_o
     assert listed.status_code == 200
     assert listed.json() == [invitation]
     assert invitation_code not in listed.text
+    assert hash_secret(invitation_code) not in listed.text
 
     with TestClient(cloud_app, base_url=PUBLIC_ORIGIN) as registration_client:
         registered = registration_client.post(
@@ -433,11 +513,17 @@ def test_reset_password_returns_plaintext_once_stores_only_argon2_hash_and_revok
     body = reset.json()
     temporary_password = body["temporary_password"]
     assert len(temporary_password) >= 32
+    assert reset.text.count(temporary_password) == 1
     assert body["user"]["id"] == target.id
     assert body["user"]["must_change_password"] is True
     assert plaintext_tmp_key not in reset.text
     assert encrypted_tmp_key not in reset.text
     assert "password_hash" not in reset.text
+    from app.cloud.routes.admin import ResetPasswordResponse
+
+    response_model = ResetPasswordResponse.model_validate(body)
+    assert temporary_password not in repr(response_model)
+    assert temporary_password not in str(response_model)
 
     with database.connection() as connection:
         stored_user = connection.execute(
@@ -482,7 +568,10 @@ def test_reset_password_returns_plaintext_once_stores_only_argon2_hash_and_revok
 
 
 def test_user_listing_contains_metadata_and_storage_usage_but_no_tmp_credentials(
-    cloud_app, database: Database, admin_client
+    cloud_app,
+    database: Database,
+    admin_client,
+    monkeypatch: pytest.MonkeyPatch,
 ):
     client, _ = admin_client
     target = create_user(cloud_app, "listed-user")
@@ -501,6 +590,15 @@ def test_user_listing_contains_metadata_and_storage_usage_but_no_tmp_credentials
             "SELECT encrypted_tmp_key FROM user_settings WHERE user_id = ?",
             (target.id,),
         ).fetchone()[0]
+
+    def fail_per_user_storage_query(user_id: str) -> int:
+        raise AssertionError("admin user listing must use one aggregate query")
+
+    monkeypatch.setattr(
+        cloud_app.state.repository,
+        "user_storage_bytes",
+        fail_per_user_storage_query,
+    )
 
     response = client.get("/api/admin/users")
 
@@ -554,8 +652,12 @@ def test_initial_admin_cli_writes_password_once_with_0600_and_requires_first_cha
     result = run_admin_cli(database_path, credentials_file)
 
     assert result.returncode == 0
-    temporary_password = credentials_file.read_text(encoding="utf-8").strip()
+    credentials = json.loads(credentials_file.read_text(encoding="utf-8"))
+    assert set(credentials) == {"username", "temporary_password"}
+    assert credentials["username"] == "bootstrap-admin"
+    temporary_password = credentials["temporary_password"]
     assert len(temporary_password) >= 32
+    assert credentials_file.read_text(encoding="utf-8").count(temporary_password) == 1
     assert temporary_password not in result.stdout
     assert temporary_password not in result.stderr
     assert stat.S_IMODE(credentials_file.stat().st_mode) == 0o600
@@ -690,7 +792,408 @@ def test_initial_admin_bootstrap_removes_credentials_when_user_insert_fails(
         )
 
     assert not credentials_file.exists()
+    assert not pending_credentials_path(credentials_file).exists()
     with original_connection() as connection:
         assert connection.execute(
             "SELECT COUNT(*) FROM users WHERE role = 'admin'"
         ).fetchone()[0] == 0
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        pytest.param(
+            sqlite3.OperationalError("injected post-commit failure"),
+            id="exception",
+        ),
+        pytest.param(KeyboardInterrupt(), id="keyboard-interrupt"),
+    ],
+)
+def test_initial_admin_bootstrap_recovers_when_commit_completed_before_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: BaseException,
+):
+    from app.cloud.admin_cli import bootstrap_initial_admin
+
+    database = Database(tmp_path / "bootstrap.db")
+    database.initialize()
+    credentials_file = tmp_path / "committed-credentials.json"
+    original_connection = database.connection
+    failure_raised = False
+
+    class CommitThenFailConnection:
+        def __init__(self):
+            self._connection = original_connection()
+
+        def __enter__(self):
+            self._connection.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self._connection.__exit__(*args)
+
+        def close(self):
+            self._connection.close()
+
+        def commit(self):
+            nonlocal failure_raised
+            self._connection.commit()
+            if not failure_raised:
+                failure_raised = True
+                raise failure
+
+        def rollback(self):
+            self._connection.rollback()
+
+        def execute(self, query: str, parameters=()):
+            return self._connection.execute(query, parameters)
+
+    monkeypatch.setattr(database, "connection", CommitThenFailConnection)
+
+    try:
+        user_id = bootstrap_initial_admin(
+            database=database,
+            username="bootstrap-admin",
+            credentials_file=credentials_file,
+        )
+    except BaseException as exc:
+        pytest.fail(
+            f"bootstrap did not recover after {type(failure).__name__}: "
+            f"{type(exc).__name__}"
+        )
+
+    credentials = json.loads(credentials_file.read_text(encoding="utf-8"))
+    assert credentials["username"] == "bootstrap-admin"
+    assert not pending_credentials_path(credentials_file).exists()
+    with original_connection() as connection:
+        row = connection.execute(
+            "SELECT * FROM users WHERE id = ?", (user_id,)
+        ).fetchone()
+    assert row is not None
+    assert PasswordService().verify(
+        row["password_hash"], credentials["temporary_password"]
+    )
+
+
+def test_initial_admin_bootstrap_cleans_pending_and_rolls_back_on_keyboard_interrupt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from app.cloud.admin_cli import bootstrap_initial_admin
+
+    database = Database(tmp_path / "bootstrap.db")
+    database.initialize()
+    credentials_file = tmp_path / "interrupted-credentials.json"
+    original_connection = database.connection
+
+    class InterruptedCommitConnection:
+        def __init__(self):
+            self._connection = original_connection()
+
+        def __enter__(self):
+            self._connection.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self._connection.__exit__(*args)
+
+        def close(self):
+            self._connection.close()
+
+        def commit(self):
+            raise KeyboardInterrupt
+
+        def rollback(self):
+            self._connection.rollback()
+
+        def execute(self, query: str, parameters=()):
+            return self._connection.execute(query, parameters)
+
+    monkeypatch.setattr(database, "connection", InterruptedCommitConnection)
+
+    with pytest.raises(KeyboardInterrupt):
+        bootstrap_initial_admin(
+            database=database,
+            username="bootstrap-admin",
+            credentials_file=credentials_file,
+        )
+
+    assert not credentials_file.exists()
+    assert not pending_credentials_path(credentials_file).exists()
+    with original_connection() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM users WHERE role = 'admin'"
+        ).fetchone()[0] == 0
+
+
+def test_initial_admin_bootstrap_restarts_after_pending_only_crash(tmp_path: Path):
+    from app.cloud.admin_cli import bootstrap_initial_admin
+
+    database = Database(tmp_path / "bootstrap.db")
+    database.initialize()
+    credentials_file = tmp_path / "pending-only-credentials.json"
+    abandoned_password = "abandoned-pending-password"
+    write_pending_credentials(
+        credentials_file,
+        username="bootstrap-admin",
+        temporary_password=abandoned_password,
+    )
+
+    user_id = bootstrap_initial_admin(
+        database=database,
+        username="bootstrap-admin",
+        credentials_file=credentials_file,
+    )
+
+    credentials = json.loads(credentials_file.read_text(encoding="utf-8"))
+    assert credentials["temporary_password"] != abandoned_password
+    assert not pending_credentials_path(credentials_file).exists()
+    with database.connection() as connection:
+        row = connection.execute(
+            "SELECT password_hash FROM users WHERE id = ?", (user_id,)
+        ).fetchone()
+    assert PasswordService().verify(
+        row["password_hash"], credentials["temporary_password"]
+    )
+
+
+def test_initial_admin_bootstrap_finalizes_matching_committed_pending(tmp_path: Path):
+    from app.cloud.admin_cli import bootstrap_initial_admin
+
+    database = Database(tmp_path / "bootstrap.db")
+    database.initialize()
+    credentials_file = tmp_path / "committed-pending-credentials.json"
+    temporary_password = "committed-pending-password"
+    pending_path = write_pending_credentials(
+        credentials_file,
+        username="bootstrap-admin",
+        temporary_password=temporary_password,
+    )
+    user_id = "committed-admin-id"
+    timestamp = datetime.now(timezone.utc).isoformat()
+    with database.connection() as connection:
+        connection.execute(
+            """
+            INSERT INTO users (
+                id, username, password_hash, role, status,
+                must_change_password, created_at, updated_at
+            ) VALUES (?, 'bootstrap-admin', ?, 'admin', 'active', 1, ?, ?)
+            """,
+            (
+                user_id,
+                PasswordService().hash(temporary_password),
+                timestamp,
+                timestamp,
+            ),
+        )
+
+    recovered_id = bootstrap_initial_admin(
+        database=database,
+        username="bootstrap-admin",
+        credentials_file=credentials_file,
+    )
+
+    assert recovered_id == user_id
+    assert not pending_path.exists()
+    assert json.loads(credentials_file.read_text(encoding="utf-8")) == {
+        "username": "bootstrap-admin",
+        "temporary_password": temporary_password,
+    }
+
+
+@pytest.mark.parametrize("entry_type", ["file", "symlink"])
+def test_initial_admin_bootstrap_refuses_existing_final_entry(
+    tmp_path: Path, entry_type: str
+):
+    from app.cloud.admin_cli import BootstrapError, bootstrap_initial_admin
+
+    database = Database(tmp_path / "bootstrap.db")
+    credentials_file = tmp_path / "existing-final-credentials.json"
+    if entry_type == "file":
+        credentials_file.write_text("do-not-overwrite", encoding="utf-8")
+    else:
+        target = tmp_path / "final-symlink-target"
+        target.write_text("do-not-overwrite", encoding="utf-8")
+        credentials_file.symlink_to(target)
+
+    with pytest.raises(BootstrapError):
+        bootstrap_initial_admin(
+            database=database,
+            username="bootstrap-admin",
+            credentials_file=credentials_file,
+        )
+
+    if entry_type == "file":
+        assert credentials_file.read_text(encoding="utf-8") == "do-not-overwrite"
+    else:
+        assert credentials_file.is_symlink()
+        assert target.read_text(encoding="utf-8") == "do-not-overwrite"
+    database.initialize()
+    with database.connection() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM users WHERE role = 'admin'"
+        ).fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("entry_type", ["file", "symlink"])
+def test_initial_admin_bootstrap_refuses_unsafe_pending_entry(
+    tmp_path: Path, entry_type: str
+):
+    from app.cloud.admin_cli import BootstrapError, bootstrap_initial_admin
+
+    database = Database(tmp_path / "bootstrap.db")
+    credentials_file = tmp_path / "unsafe-pending-credentials.json"
+    pending_path = pending_credentials_path(credentials_file)
+    if entry_type == "file":
+        pending_path.write_text("not valid credential JSON", encoding="utf-8")
+    else:
+        target = tmp_path / "pending-symlink-target"
+        target.write_text("do-not-overwrite", encoding="utf-8")
+        pending_path.symlink_to(target)
+
+    with pytest.raises(BootstrapError):
+        bootstrap_initial_admin(
+            database=database,
+            username="bootstrap-admin",
+            credentials_file=credentials_file,
+        )
+
+    assert not credentials_file.exists()
+    if entry_type == "file":
+        assert pending_path.read_text(encoding="utf-8") == "not valid credential JSON"
+    else:
+        assert pending_path.is_symlink()
+        assert target.read_text(encoding="utf-8") == "do-not-overwrite"
+    database.initialize()
+    with database.connection() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM users WHERE role = 'admin'"
+        ).fetchone()[0] == 0
+
+
+def test_initial_admin_bootstrap_refuses_symlink_parent(tmp_path: Path):
+    from app.cloud.admin_cli import BootstrapError, bootstrap_initial_admin
+
+    database = Database(tmp_path / "bootstrap.db")
+    real_parent = tmp_path / "real-credentials-parent"
+    real_parent.mkdir()
+    symlink_parent = tmp_path / "credentials-parent-link"
+    symlink_parent.symlink_to(real_parent, target_is_directory=True)
+    credentials_file = symlink_parent / "initial-admin.json"
+
+    with pytest.raises(BootstrapError):
+        bootstrap_initial_admin(
+            database=database,
+            username="bootstrap-admin",
+            credentials_file=credentials_file,
+        )
+
+    assert not (real_parent / credentials_file.name).exists()
+    assert not (real_parent / f".{credentials_file.name}.pending").exists()
+    database.initialize()
+    with database.connection() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM users WHERE role = 'admin'"
+        ).fetchone()[0] == 0
+
+
+def test_initial_admin_bootstrap_refuses_pending_that_mismatches_existing_admin(
+    tmp_path: Path,
+):
+    from app.cloud.admin_cli import BootstrapError, bootstrap_initial_admin
+
+    database = Database(tmp_path / "bootstrap.db")
+    database.initialize()
+    credentials_file = tmp_path / "mismatched-pending-credentials.json"
+    temporary_password = "pending-password-for-different-admin"
+    pending_path = write_pending_credentials(
+        credentials_file,
+        username="bootstrap-admin",
+        temporary_password=temporary_password,
+    )
+    config = CloudConfig(
+        mode="cloud",
+        session_secret="unused-session-secret",
+        key_encryption_key=Fernet.generate_key().decode("ascii"),
+        database_path=database.path,
+        storage_path=tmp_path / "unused-files",
+        public_origin=PUBLIC_ORIGIN,
+    )
+    create_cloud_app(config, database).state.repository.create_user(
+        "other-admin",
+        PasswordService().hash("different-password"),
+        role="admin",
+    )
+
+    with pytest.raises(BootstrapError) as error:
+        bootstrap_initial_admin(
+            database=database,
+            username="bootstrap-admin",
+            credentials_file=credentials_file,
+        )
+
+    assert temporary_password not in str(error.value)
+    assert temporary_password not in repr(error.value)
+    assert pending_path.exists()
+    assert not credentials_file.exists()
+
+
+def test_initial_admin_bootstrap_fsyncs_pending_then_commits_renames_and_fsyncs_parent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    import app.cloud.admin_cli as admin_cli
+
+    database = Database(tmp_path / "bootstrap.db")
+    database.initialize()
+    credentials_file = tmp_path / "durable-credentials.json"
+    original_connection = database.connection
+    original_fsync = os.fsync
+    events: list[str] = []
+
+    class RecordingCommitConnection:
+        def __init__(self):
+            self._connection = original_connection()
+
+        def __enter__(self):
+            self._connection.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self._connection.__exit__(*args)
+
+        def close(self):
+            self._connection.close()
+
+        def commit(self):
+            events.append("commit")
+            self._connection.commit()
+
+        def rollback(self):
+            self._connection.rollback()
+
+        def execute(self, query: str, parameters=()):
+            return self._connection.execute(query, parameters)
+
+    def recording_fsync(descriptor: int):
+        mode = os.fstat(descriptor).st_mode
+        events.append("fsync-parent" if stat.S_ISDIR(mode) else "fsync-pending")
+        original_fsync(descriptor)
+
+    original_rename = admin_cli._rename_pending_credentials
+
+    def recording_rename(*args, **kwargs):
+        events.append("rename")
+        return original_rename(*args, **kwargs)
+
+    monkeypatch.setattr(database, "connection", RecordingCommitConnection)
+    monkeypatch.setattr(admin_cli.os, "fsync", recording_fsync)
+    monkeypatch.setattr(admin_cli, "_rename_pending_credentials", recording_rename)
+
+    admin_cli.bootstrap_initial_admin(
+        database=database,
+        username="bootstrap-admin",
+        credentials_file=credentials_file,
+    )
+
+    assert events[:4] == ["fsync-pending", "commit", "rename", "fsync-parent"]
+    assert stat.S_IMODE(credentials_file.stat().st_mode) == 0o600
