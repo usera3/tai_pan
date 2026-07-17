@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import fcntl
 import sqlite3
 import stat
 import subprocess
@@ -726,6 +727,50 @@ def test_initial_admin_bootstrap_never_overwrites_existing_admin_or_credentials(
         assert connection.execute(
             "SELECT COUNT(*) FROM users WHERE role = 'admin'"
         ).fetchone()[0] == 1
+    lock_path = credentials_file.with_name(f".{credentials_file.name}.lock")
+    assert stat.S_ISREG(lock_path.stat().st_mode)
+    assert stat.S_IMODE(lock_path.stat().st_mode) == 0o600
+    assert lock_path.stat().st_size == 0
+    temporary_password = json.loads(original_credentials)["temporary_password"]
+    assert temporary_password not in lock_path.read_text(encoding="utf-8")
+
+
+def test_initial_admin_cli_blocks_on_cross_process_lock(tmp_path: Path):
+    database_path = tmp_path / "blocked-bootstrap.db"
+    credentials_file = tmp_path / "blocked-bootstrap.json"
+    lock_path = credentials_file.with_name(f".{credentials_file.name}.lock")
+    lock_path.touch(mode=0o600)
+    lock_path.chmod(0o600)
+    lock_descriptor = os.open(lock_path, os.O_RDWR)
+    fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "app.cloud.admin_cli",
+            "--database-path",
+            str(database_path),
+            "--username",
+            "bootstrap-admin",
+            "--credentials-file",
+            str(credentials_file),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        with pytest.raises(subprocess.TimeoutExpired):
+            process.wait(timeout=0.25)
+    finally:
+        fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
+        os.close(lock_descriptor)
+
+    stdout, stderr = process.communicate(timeout=30)
+    assert process.returncode == 0
+    credentials = json.loads(credentials_file.read_text(encoding="utf-8"))
+    assert credentials["temporary_password"] not in stdout
+    assert credentials["temporary_password"] not in stderr
 
 
 def test_initial_admin_bootstrap_rolls_back_when_credential_write_fails(
@@ -1124,15 +1169,16 @@ def test_initial_admin_bootstrap_refuses_symlink_ancestor(tmp_path: Path):
     assert not (nested_parent / ".credentials.json.pending").exists()
 
 
-def test_initial_admin_bootstrap_refuses_group_writable_credentials_directory(
-    tmp_path: Path,
+@pytest.mark.parametrize("unsafe_mode", [0o770, 0o755, 0o710])
+def test_initial_admin_bootstrap_requires_owner_only_credentials_directory(
+    tmp_path: Path, unsafe_mode: int
 ):
     from app.cloud.admin_cli import BootstrapError, bootstrap_initial_admin
 
     database = Database(tmp_path / "bootstrap.db")
     unsafe_parent = tmp_path / "unsafe-parent"
-    unsafe_parent.mkdir(mode=0o770)
-    unsafe_parent.chmod(0o770)
+    unsafe_parent.mkdir(mode=unsafe_mode)
+    unsafe_parent.chmod(unsafe_mode)
 
     with pytest.raises(BootstrapError):
         bootstrap_initial_admin(
@@ -1335,6 +1381,33 @@ def test_initial_admin_bootstrap_refuses_legacy_anchor_state(
     assert pin_path.exists()
 
 
+def test_initial_admin_bootstrap_rejects_pending_with_unexpected_hard_link(
+    tmp_path: Path,
+):
+    from app.cloud.admin_cli import BootstrapError, bootstrap_initial_admin
+
+    database = Database(tmp_path / "linked-pending.db")
+    credentials_file = tmp_path / "linked-pending.json"
+    pending_path = write_pending_credentials(
+        credentials_file,
+        username="bootstrap-admin",
+        temporary_password="linked-pending-password",
+    )
+    unexpected_link = tmp_path / "unexpected-secret-copy"
+    os.link(pending_path, unexpected_link)
+
+    with pytest.raises(BootstrapError):
+        bootstrap_initial_admin(
+            database=database,
+            username="bootstrap-admin",
+            credentials_file=credentials_file,
+        )
+
+    assert not credentials_file.exists()
+    assert pending_path.exists()
+    assert unexpected_link.exists()
+
+
 @pytest.mark.parametrize("entry_type", ["regular", "symlink"])
 def test_initial_admin_bootstrap_validates_existing_lock_entry(
     tmp_path: Path, entry_type: str
@@ -1459,6 +1532,35 @@ def test_initial_admin_bootstrap_cleans_interrupted_os_write(
     assert not pending_credentials_path(credentials_file).exists()
 
 
+def test_pending_cleanup_does_not_unlink_replacement_inode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    import app.cloud.admin_cli as admin_cli
+
+    database = Database(tmp_path / "bootstrap.db")
+    credentials_file = tmp_path / "replacement-cleanup.json"
+    pending_path = pending_credentials_path(credentials_file)
+    sentinel = "replacement-must-survive"
+
+    def replace_pending_then_interrupt(*args, **kwargs):
+        pending_path.unlink()
+        pending_path.write_text(sentinel, encoding="utf-8")
+        pending_path.chmod(0o600)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(admin_cli.os, "write", replace_pending_then_interrupt)
+
+    with pytest.raises(KeyboardInterrupt):
+        admin_cli.bootstrap_initial_admin(
+            database=database,
+            username="bootstrap-admin",
+            credentials_file=credentials_file,
+        )
+
+    assert not credentials_file.exists()
+    assert pending_path.read_text(encoding="utf-8") == sentinel
+
+
 @pytest.mark.parametrize("failure_point", ["fchmod", "metadata"])
 def test_initial_admin_bootstrap_cleans_pre_metadata_pending_interrupt(
     tmp_path: Path,
@@ -1482,11 +1584,18 @@ def test_initial_admin_bootstrap_cleans_pre_metadata_pending_interrupt(
 
         monkeypatch.setattr(admin_cli.os, "fchmod", interrupt_pending_fchmod)
     else:
-        monkeypatch.setattr(
-            admin_cli,
-            "_validate_pending_metadata",
-            lambda metadata: (_ for _ in ()).throw(KeyboardInterrupt()),
-        )
+        original_fstat = os.fstat
+        interrupted = False
+
+        def interrupt_pending_fstat(descriptor: int):
+            nonlocal interrupted
+            target = os.readlink(f"/proc/self/fd/{descriptor}")
+            if target.endswith(".pending") and not interrupted:
+                interrupted = True
+                raise KeyboardInterrupt
+            return original_fstat(descriptor)
+
+        monkeypatch.setattr(admin_cli.os, "fstat", interrupt_pending_fstat)
 
     with pytest.raises(KeyboardInterrupt):
         admin_cli.bootstrap_initial_admin(
@@ -1527,6 +1636,10 @@ def test_initial_admin_bootstrap_survives_resource_close_errors(
     credentials_file = tmp_path / "close-errors.json"
     original_connection = database.connection
     original_pending_close = admin_cli._PendingCredentials.close
+    original_open_directory = admin_cli._open_credentials_directory
+    original_flock = admin_cli.fcntl.flock
+    opened_directory_fds: list[int] = []
+    flock_operations: list[int] = []
 
     class CloseFailConnection:
         def __init__(self):
@@ -1549,12 +1662,23 @@ def test_initial_admin_bootstrap_survives_resource_close_errors(
         original_pending_close(pending)
         raise OSError("injected pending close failure")
 
+    def capture_directory_fd(path):
+        descriptor = original_open_directory(path)
+        opened_directory_fds.append(descriptor)
+        return descriptor
+
+    def record_flock(descriptor: int, operation: int):
+        flock_operations.append(operation)
+        return original_flock(descriptor, operation)
+
     monkeypatch.setattr(database, "connection", CloseFailConnection)
     monkeypatch.setattr(
         admin_cli._PendingCredentials,
         "close",
         close_pending_then_fail,
     )
+    monkeypatch.setattr(admin_cli, "_open_credentials_directory", capture_directory_fd)
+    monkeypatch.setattr(admin_cli.fcntl, "flock", record_flock)
 
     user_id = admin_cli.bootstrap_initial_admin(
         database=database,
@@ -1567,6 +1691,17 @@ def test_initial_admin_bootstrap_survives_resource_close_errors(
     assert json.loads(credentials_file.read_text(encoding="utf-8"))["username"] == (
         "bootstrap-admin"
     )
+    assert admin_cli.fcntl.LOCK_UN in flock_operations
+    assert len(opened_directory_fds) == 1
+    with pytest.raises(OSError):
+        os.fstat(opened_directory_fds[0])
+    lock_path = credentials_file.with_name(f".{credentials_file.name}.lock")
+    descriptor = os.open(lock_path, os.O_RDWR)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
 
 
 def test_initial_admin_bootstrap_keeps_pending_when_commit_verification_errors(
