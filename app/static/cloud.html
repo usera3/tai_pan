@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>钛盘云端</title>
+  <link rel="stylesheet" href="/static/cloud.css">
+</head>
+<body>
+  <div id="boot-status" class="boot-status" role="status">
+    <div class="brand-mark"><i data-lucide="hard-drive"></i></div>
+    <span>正在载入钛盘云端</span>
+  </div>
+
+  <main id="auth-shell" class="auth-shell" hidden>
+    <section class="auth-panel" aria-labelledby="auth-title">
+      <div class="auth-brand">
+        <div class="brand-mark"><i data-lucide="hard-drive"></i></div>
+        <div><strong id="auth-title">钛盘云端</strong><span>文件管理</span></div>
+      </div>
+      <div class="auth-tabs" role="tablist" aria-label="账号入口">
+        <button id="login-tab" class="auth-tab is-active" type="button" role="tab" aria-selected="true" aria-controls="login-form">登录</button>
+        <button id="register-tab" class="auth-tab" type="button" role="tab" aria-selected="false" aria-controls="register-form">邀请注册</button>
+      </div>
+      <form id="login-form" class="auth-form">
+        <label for="login-username">用户名</label>
+        <div class="field"><i data-lucide="user"></i><input id="login-username" name="username" autocomplete="username" required></div>
+        <label for="login-password">密码</label>
+        <div class="field"><i data-lucide="lock-keyhole"></i><input id="login-password" name="password" type="password" autocomplete="current-password" required></div>
+        <p id="login-message" class="form-message" role="status"></p>
+        <button id="login-submit" class="button primary wide" type="submit"><i data-lucide="log-in"></i><span>登录</span></button>
+      </form>
+      <form id="register-form" class="auth-form" hidden>
+        <label for="register-username">用户名</label>
+        <div class="field"><i data-lucide="user-plus"></i><input id="register-username" name="username" autocomplete="username" minlength="3" maxlength="32" required></div>
+        <label for="register-password">密码</label>
+        <div class="field"><i data-lucide="lock-keyhole"></i><input id="register-password" name="password" type="password" autocomplete="new-password" minlength="12" required></div>
+        <label for="register-invitation">邀请码</label>
+        <div class="field"><i data-lucide="ticket-check"></i><input id="register-invitation" name="invitation" autocomplete="off" required></div>
+        <p id="register-message" class="form-message" role="status"></p>
+        <button id="register-submit" class="button primary wide" type="submit"><i data-lucide="user-plus"></i><span>创建账号</span></button>
+      </form>
+    </section>
+  </main>
+
+  <main id="password-shell" class="auth-shell" hidden>
+    <section class="auth-panel" aria-labelledby="password-title">
+      <div class="auth-brand">
+        <div class="brand-mark"><i data-lucide="shield-check"></i></div>
+        <div><strong id="password-title">修改初始密码</strong><span id="password-user"></span></div>
+      </div>
+      <form id="password-form" class="auth-form">
+        <label for="current-password">当前密码</label>
+        <div class="field"><i data-lucide="key-round"></i><input id="current-password" type="password" autocomplete="current-password" required></div>
+        <label for="new-password">新密码</label>
+        <div class="field"><i data-lucide="lock-keyhole"></i><input id="new-password" type="password" autocomplete="new-password" minlength="12" required></div>
+        <label for="confirm-password">确认新密码</label>
+        <div class="field"><i data-lucide="check"></i><input id="confirm-password" type="password" autocomplete="new-password" minlength="12" required></div>
+        <p id="password-message" class="form-message" role="status"></p>
+        <button id="password-submit" class="button primary wide" type="submit"><i data-lucide="save"></i><span>保存新密码</span></button>
+      </form>
+    </section>
+  </main>
+
+  <div id="app-shell" class="app-shell" hidden>
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark"><i data-lucide="hard-drive"></i></div>
+        <div class="brand-copy"><strong>钛盘云端</strong><small>文件管理</small></div>
+      </div>
+      <nav id="primary-nav" class="nav-list" aria-label="主导航">
+        <button class="nav-item is-active" type="button" data-view="files"><i data-lucide="files"></i><span>文件</span></button>
+        <button class="nav-item" type="button" data-view="links"><i data-lucide="link-2"></i><span>直链</span></button>
+        <button class="nav-item" type="button" data-view="settings"><i data-lucide="settings-2"></i><span>设置</span></button>
+      </nav>
+      <div class="sidebar-account"><span id="sidebar-username"></span><small id="sidebar-role"></small></div>
+    </aside>
+
+    <div class="workspace">
+      <header class="topbar">
+        <div><p class="eyebrow">钛盘云端</p><h1 id="view-title">文件</h1></div>
+        <div class="account-actions">
+          <span id="topbar-username"></span>
+          <button id="logout-button" class="icon-button" type="button" title="退出登录" aria-label="退出登录"><i data-lucide="log-out"></i></button>
+        </div>
+      </header>
+
+      <main class="content">
+        <section id="view-files" class="view is-active" data-view-panel="files">
+          <div class="quota-band">
+            <div class="quota-copy"><span>云端永久空间</span><strong id="cloud-quota-text">载入中</strong></div>
+            <div class="quota-track" role="progressbar" aria-label="云端永久空间用量" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span id="cloud-quota-bar"></span></div>
+          </div>
+
+          <section class="section-band" aria-labelledby="upload-title">
+            <div class="section-heading">
+              <div><p class="section-label">上传</p><h2 id="upload-title">添加文件</h2></div>
+              <div class="toolbar-actions">
+                <label class="compact-field">位置
+                  <select id="upload-storage" aria-label="上传位置">
+                    <option value="tmp">钛盘临时</option>
+                    <option value="cloud">云端永久</option>
+                  </select>
+                </label>
+                <label class="compact-field">有效期
+                  <select id="upload-model" aria-label="临时文件有效期">
+                    <option value="0">24 小时</option>
+                    <option value="2" selected>3 天</option>
+                    <option value="1">7 天</option>
+                  </select>
+                </label>
+                <button id="choose-files" class="button secondary" type="button"><i data-lucide="plus"></i><span>选择文件</span></button>
+                <input id="upload-input" type="file" multiple hidden>
+                <button id="upload-all" class="button primary" type="button" disabled><i data-lucide="upload"></i><span>开始上传</span></button>
+              </div>
+            </div>
+            <div id="upload-queue" class="upload-queue" aria-live="polite"><div class="empty-state">暂无待上传文件</div></div>
+          </section>
+
+          <section class="section-band" aria-labelledby="files-title">
+            <div class="section-heading">
+              <div><p class="section-label">全部来源</p><h2 id="files-title">文件列表</h2></div>
+              <button id="refresh-files" class="icon-button" type="button" title="刷新文件" aria-label="刷新文件"><i data-lucide="refresh-cw"></i></button>
+            </div>
+            <div id="files-state" class="empty-state" role="status">正在载入文件</div>
+            <div id="files-table-wrap" class="table-wrap" hidden>
+              <table>
+                <thead><tr><th>名称</th><th>来源</th><th>大小</th><th class="actions-column">操作</th></tr></thead>
+                <tbody id="files-body"></tbody>
+              </table>
+            </div>
+          </section>
+        </section>
+
+        <section id="view-links" class="view" data-view-panel="links">
+          <div class="page-heading"><div><p class="section-label">钛盘</p><h2>直链</h2></div><button id="new-link" class="button primary" type="button"><i data-lucide="plus"></i><span>创建直链</span></button></div>
+          <div id="links-state" class="empty-state" role="status">正在载入直链</div>
+          <div id="links-table-wrap" class="table-wrap" hidden>
+            <table><thead><tr><th>DKEY</th><th>地址</th><th class="actions-column">操作</th></tr></thead><tbody id="links-body"></tbody></table>
+          </div>
+        </section>
+
+        <section id="view-settings" class="view" data-view-panel="settings">
+          <div class="page-heading"><div><p class="section-label">账号</p><h2>连接设置</h2></div><span id="key-status" class="status-badge">未配置</span></div>
+          <form id="settings-form" class="settings-form">
+            <label for="api-key">钛盘 API Key</label>
+            <div class="field"><i data-lucide="key-round"></i><input id="api-key" type="password" autocomplete="off" value=""></div>
+            <label for="custom-domain">自定义域名</label>
+            <div class="field"><i data-lucide="globe-2"></i><input id="custom-domain" autocomplete="off" required></div>
+            <p id="settings-message" class="form-message" role="status"></p>
+            <div class="form-actions">
+              <button id="settings-save" class="button primary" type="submit"><i data-lucide="save"></i><span>保存</span></button>
+              <button id="settings-test" class="button secondary" type="button"><i data-lucide="plug-zap"></i><span>测试连接</span></button>
+              <button id="settings-clear" class="button danger-text" type="button"><i data-lucide="key-round"></i><span>清除 Key</span></button>
+            </div>
+          </form>
+        </section>
+
+        <section id="view-admin" class="view" data-view-panel="admin" hidden>
+          <div class="page-heading"><div><p class="section-label">管理员</p><h2>用户与邀请</h2></div><button id="create-invitation" class="button primary" type="button"><i data-lucide="ticket-plus"></i><span>创建邀请码</span></button></div>
+          <div class="admin-tabs" role="tablist" aria-label="管理视图">
+            <button class="admin-tab is-active" type="button" data-admin-tab="users">用户</button>
+            <button class="admin-tab" type="button" data-admin-tab="invitations">邀请</button>
+          </div>
+          <div id="admin-users-panel">
+            <div id="users-state" class="empty-state" role="status">正在载入用户</div>
+            <div id="users-table-wrap" class="table-wrap" hidden><table><thead><tr><th>用户</th><th>状态</th><th>云端用量</th><th class="actions-column">操作</th></tr></thead><tbody id="users-body"></tbody></table></div>
+          </div>
+          <div id="admin-invitations-panel" hidden>
+            <div id="invitations-state" class="empty-state" role="status">正在载入邀请</div>
+            <div id="invitations-table-wrap" class="table-wrap" hidden><table><thead><tr><th>状态</th><th>创建时间</th><th>到期时间</th><th class="actions-column">操作</th></tr></thead><tbody id="invitations-body"></tbody></table></div>
+          </div>
+        </section>
+      </main>
+    </div>
+  </div>
+
+  <dialog id="confirm-dialog" class="dialog">
+    <form method="dialog" class="dialog-form">
+      <div class="dialog-heading"><div><p class="section-label">确认操作</p><h2 id="confirm-title">确认</h2></div><button class="icon-button" value="cancel" aria-label="关闭" title="关闭"><i data-lucide="x"></i></button></div>
+      <p id="confirm-copy" class="dialog-copy"></p>
+      <div class="dialog-actions"><button class="button secondary" value="cancel">取消</button><button id="confirm-accept" class="button danger" value="default">确认</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="link-dialog" class="dialog">
+    <form id="link-form" class="dialog-form">
+      <div class="dialog-heading"><div><p class="section-label">钛盘</p><h2>创建直链</h2></div><button id="link-close" class="icon-button" type="button" aria-label="关闭" title="关闭"><i data-lucide="x"></i></button></div>
+      <label for="link-ukey">文件 UKEY</label><input id="link-ukey" required maxlength="128">
+      <div class="two-column-fields"><label for="link-valid-time">有效分钟<input id="link-valid-time" type="number" min="1"></label><label for="link-download-limit">下载次数<input id="link-download-limit" type="number" min="1"></label></div>
+      <p id="link-message" class="form-message" role="status"></p>
+      <div class="dialog-actions"><button class="button secondary" type="button" id="link-cancel">取消</button><button id="link-submit" class="button primary" type="submit">创建</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="invitation-dialog" class="dialog">
+    <form id="invitation-form" class="dialog-form">
+      <div class="dialog-heading"><div><p class="section-label">管理员</p><h2>创建邀请码</h2></div><button id="invitation-close" class="icon-button" type="button" aria-label="关闭" title="关闭"><i data-lucide="x"></i></button></div>
+      <label for="invitation-expiry">到期时间</label><input id="invitation-expiry" type="datetime-local">
+      <p id="invitation-message" class="form-message" role="status"></p>
+      <div class="dialog-actions"><button class="button secondary" type="button" id="invitation-cancel">取消</button><button id="invitation-submit" class="button primary" type="submit">创建</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="secret-dialog" class="dialog">
+    <form method="dialog" class="dialog-form">
+      <div class="dialog-heading"><div><p class="section-label">一次性凭据</p><h2 id="secret-title">凭据</h2></div><button class="icon-button" value="default" aria-label="关闭" title="关闭"><i data-lucide="x"></i></button></div>
+      <label for="secret-value">值</label><div class="copy-field"><input id="secret-value" readonly><button id="secret-copy" class="icon-button" type="button" title="复制" aria-label="复制"><i data-lucide="copy"></i></button></div>
+      <div class="dialog-actions"><button id="secret-close" class="button primary" value="default">关闭</button></div>
+    </form>
+  </dialog>
+
+  <div id="toast-region" class="toast-region" aria-live="polite"></div>
+  <div id="download-bin" hidden></div>
+  <script src="/static/vendor/lucide.min.js"></script>
+  <script src="/static/cloud.js"></script>
+</body>
+</html>

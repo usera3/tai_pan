@@ -48,6 +48,7 @@ class AuthResponse(BaseModel):
 
 class MeResponse(BaseModel):
     user: PublicUser
+    csrf_token: str = Field(repr=False)
 
 
 class MessageResponse(BaseModel):

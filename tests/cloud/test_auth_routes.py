@@ -16,7 +16,7 @@ from app.cloud.config import CloudConfig
 from app.cloud.db import Database
 from app.cloud.dependencies import active_user, admin_user
 from app.cloud.schemas import LoginRequest, RegisterRequest
-from app.cloud.security import hash_secret
+from app.cloud.security import derive_csrf_token, hash_secret
 
 
 PUBLIC_ORIGIN = "https://cloud.example.com"
@@ -150,6 +150,9 @@ def test_registration_consumes_invitation_once_and_stores_only_secret_hashes(
     assert invitation["used_by"] == body["user"]["id"]
     assert invitation["code_hash"] == hash_secret(invitation_code)
     assert session["token_hash"] == hash_secret(session_token)
+    assert body["csrf_token"] == derive_csrf_token(
+        cloud_app.state.config.session_secret, session_token
+    )
     assert session["csrf_hash"] == hash_secret(body["csrf_token"])
     assert invitation_code not in tuple(invitation)
     assert session_token not in tuple(session)
@@ -351,7 +354,64 @@ def test_login_returns_authenticated_json_and_secure_cookie(cloud_app, client):
     assert response.json()["user"]["id"] == user.id
     assert response.json()["csrf_token"]
     assert_secure_session_cookie(response)
-    assert client.get("/api/auth/me").json() == {"user": response.json()["user"]}
+    assert client.get("/api/auth/me").json() == response.json()
+    assert response.json()["csrf_token"] == derive_csrf_token(
+        cloud_app.state.config.session_secret, client.cookies["session"]
+    )
+    session = cloud_app.state.repository.get_active_session_by_token(
+        client.cookies["session"]
+    )
+    assert session is not None
+    assert session.csrf_hash == hash_secret(response.json()["csrf_token"])
+
+
+def test_me_recovers_stable_csrf_token_that_authorizes_logout(cloud_app, client):
+    create_user(cloud_app, "csrf-recovery-user")
+
+    authenticated = login(client, username="csrf-recovery-user")
+    first_me = client.get("/api/auth/me")
+    second_me = client.get("/api/auth/me")
+
+    assert authenticated.status_code == first_me.status_code == second_me.status_code == 200
+    assert first_me.json() == second_me.json() == authenticated.json()
+    logged_out = client.post(
+        "/api/auth/logout",
+        headers=csrf_headers(first_me.json()["csrf_token"]),
+    )
+    assert logged_out.status_code == 200
+
+
+def test_recovered_csrf_token_rejects_wrong_origin_and_token(cloud_app, client):
+    create_user(cloud_app, "csrf-rejection-user")
+    login(client, username="csrf-rejection-user")
+    csrf_token = client.get("/api/auth/me").json()["csrf_token"]
+
+    wrong_origin = client.post(
+        "/api/auth/logout",
+        headers=csrf_headers(csrf_token, origin="https://attacker.example"),
+    )
+    wrong_token = client.post(
+        "/api/auth/logout",
+        headers=csrf_headers("wrong-csrf-token"),
+    )
+    accepted = client.post("/api/auth/logout", headers=csrf_headers(csrf_token))
+
+    assert wrong_origin.status_code == wrong_token.status_code == 403
+    assert accepted.status_code == 200
+
+
+def test_csrf_token_is_stable_per_session_and_distinct_between_sessions(
+    cloud_app, client: TestClient
+):
+    user = create_user(cloud_app, "csrf-session-isolation-user")
+    first = login(client, username=user.username)
+
+    with TestClient(cloud_app, base_url=PUBLIC_ORIGIN) as other_client:
+        second = login(other_client, username=user.username)
+        assert first.status_code == second.status_code == 200
+        assert first.json()["csrf_token"] == client.get("/api/auth/me").json()["csrf_token"]
+        assert second.json()["csrf_token"] == other_client.get("/api/auth/me").json()["csrf_token"]
+        assert first.json()["csrf_token"] != second.json()["csrf_token"]
 
 
 def test_login_failures_are_generic_for_unknown_wrong_and_disabled_users(
@@ -651,6 +711,16 @@ def test_password_change_revokes_other_sessions_and_keeps_only_new_session(
         assert changed.status_code == 200
         assert other.status_code == 200
         assert client.cookies["session"] not in {first_token, other_token}
+        replacement_session = cloud_app.state.repository.get_active_session_by_token(
+            client.cookies["session"]
+        )
+        assert replacement_session is not None
+        assert changed.json()["csrf_token"] == derive_csrf_token(
+            cloud_app.state.config.session_secret, client.cookies["session"]
+        )
+        assert replacement_session.csrf_hash == hash_secret(
+            changed.json()["csrf_token"]
+        )
         assert cloud_app.state.repository.get_active_session_by_token(
             first_token
         ) is None

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.staticfiles import StaticFiles
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from app.client import TmpLinkClient
@@ -208,4 +210,16 @@ def create_cloud_app(config: CloudConfig, database: Database) -> FastAPI:
     application.include_router(settings_router)
     application.include_router(tmp_files_router)
     application.include_router(links_router)
+
+    static_dir = Path(__file__).parents[1] / "static"
+
+    @application.get("/", include_in_schema=False)
+    async def cloud_index():
+        return FileResponse(static_dir / "cloud.html")
+
+    @application.get("/favicon.ico", include_in_schema=False)
+    async def favicon():
+        return Response(status_code=204)
+
+    application.mount("/static", StaticFiles(directory=static_dir), name="static")
     return application

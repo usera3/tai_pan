@@ -5,7 +5,7 @@ import hmac
 from fastapi import Depends, HTTPException, Request, status
 
 from app.cloud.repository import CloudRepository, User
-from app.cloud.security import hash_secret
+from app.cloud.security import derive_csrf_token, hash_secret
 
 
 AUTHENTICATION_REQUIRED = "Authentication required"
@@ -38,7 +38,15 @@ def current_user(
             detail=AUTHENTICATION_REQUIRED,
         )
     request.state.cloud_session = session
+    request.state.cloud_session_token = token
     return user
+
+
+def current_csrf_token(request: Request) -> str:
+    session_secret = request.app.state.config.session_secret
+    if session_secret is None:
+        raise RuntimeError("cloud session secret is unavailable")
+    return derive_csrf_token(session_secret, request.state.cloud_session_token)
 
 
 def active_user(user: User = Depends(current_user)) -> User:
@@ -65,12 +73,13 @@ def verify_csrf(
 ) -> User:
     expected_origin = request.app.state.config.public_origin
     supplied_origin = request.headers.get("origin")
-    supplied_token = request.headers.get("x-csrf-token")
+    supplied_token = request.headers.get("x-csrf-token") or ""
     session = request.state.cloud_session
-    valid_token = bool(supplied_token) and hmac.compare_digest(
+    valid_token = hmac.compare_digest(supplied_token, current_csrf_token(request))
+    legacy_valid_token = hmac.compare_digest(
         hash_secret(supplied_token), session.csrf_hash
     )
-    if supplied_origin != expected_origin or not valid_token:
+    if supplied_origin != expected_origin or not (valid_token or legacy_valid_token):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="CSRF validation failed",

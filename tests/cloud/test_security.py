@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 
 import pytest
 from cryptography.fernet import Fernet
@@ -10,6 +11,7 @@ from app.cloud.security import (
     PasswordService,
     SecretDecryptionError,
     TokenService,
+    derive_csrf_token,
     hash_secret,
 )
 
@@ -26,16 +28,30 @@ def test_password_service_uses_argon2id_and_verifies_without_raising():
     assert password not in repr(service)
 
 
-def test_token_service_generates_independent_random_session_and_csrf_tokens():
+def test_token_service_generates_independent_random_session_tokens():
     service = TokenService()
 
     session_tokens = {service.generate_session_token() for _ in range(4)}
-    csrf_tokens = {service.generate_csrf_token() for _ in range(4)}
 
     assert len(session_tokens) == 4
-    assert len(csrf_tokens) == 4
-    assert session_tokens.isdisjoint(csrf_tokens)
-    assert all(len(token) >= 43 for token in session_tokens | csrf_tokens)
+    assert all(len(token) >= 43 for token in session_tokens)
+
+
+def test_csrf_token_is_a_domain_separated_hmac_without_source_value_leaks():
+    session_secret = "csrf-hmac-session-secret"
+    session_token = "csrf-hmac-session-token"
+
+    csrf_token = derive_csrf_token(session_secret, session_token)
+
+    expected = hmac.new(
+        session_secret.encode("utf-8"),
+        b"cloud-csrf-token:v1:\x00" + session_token.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    assert csrf_token == expected
+    assert len(csrf_token) == 64
+    assert session_secret not in repr(csrf_token)
+    assert session_token not in repr(csrf_token)
 
 
 def test_hash_secret_is_the_lowercase_sha256_hex_digest():

@@ -333,6 +333,16 @@ async def download_file(
         await asyncio.sleep(DOWNLOAD_CLAIM_POLL_SECONDS)
 
 
+@router.get("/files/{ukey}/download")
+async def download_permanent_file(
+    ukey: IdentifierPath,
+    request: Request,
+    source: Literal["cloud"] = Query(default="cloud"),
+    user: User = Depends(active_user),
+) -> Any:
+    return download_cloud_file(request, user, ukey)
+
+
 @router.delete("/files/{ukey}")
 async def delete_file(
     ukey: IdentifierPath,

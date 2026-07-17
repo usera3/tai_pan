@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import secrets
 
 from argon2 import PasswordHasher
@@ -63,9 +64,14 @@ class TokenService:
     def generate_session_token() -> str:
         return secrets.token_urlsafe(32)
 
-    @staticmethod
-    def generate_csrf_token() -> str:
-        return secrets.token_urlsafe(32)
+
+def derive_csrf_token(session_secret: str, session_token: str) -> str:
+    return hmac.new(
+        _encode_protected_value(session_secret, "utf-8"),
+        b"cloud-csrf-token:v1:\x00"
+        + _encode_protected_value(session_token, "utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
 
 
 def hash_secret(value: str) -> str:

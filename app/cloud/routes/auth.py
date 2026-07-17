@@ -5,8 +5,9 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 
-from app.cloud.dependencies import current_user, verify_csrf
+from app.cloud.dependencies import current_csrf_token, current_user, verify_csrf
 from app.cloud.repository import CloudRepository, User, normalize_username
+from app.cloud.security import derive_csrf_token
 from app.cloud.schemas import (
     AuthResponse,
     ChangePasswordRequest,
@@ -74,11 +75,11 @@ def _clear_session_cookie(response: Response) -> None:
 
 
 def _new_session_tokens(request: Request) -> tuple[str, str]:
-    token_service = request.app.state.token_service
-    return (
-        token_service.generate_session_token(),
-        token_service.generate_csrf_token(),
-    )
+    session_token = request.app.state.token_service.generate_session_token()
+    session_secret = request.app.state.config.session_secret
+    if session_secret is None:
+        raise RuntimeError("cloud session secret is unavailable")
+    return session_token, derive_csrf_token(session_secret, session_token)
 
 
 def _complete_authentication(
@@ -262,8 +263,11 @@ def login(
 
 
 @router.get("/me", response_model=MeResponse)
-def me(user: User = Depends(current_user)) -> MeResponse:
-    return MeResponse(user=PublicUser.from_user(user))
+def me(request: Request, user: User = Depends(current_user)) -> MeResponse:
+    return MeResponse(
+        user=PublicUser.from_user(user),
+        csrf_token=current_csrf_token(request),
+    )
 
 
 @router.post(
