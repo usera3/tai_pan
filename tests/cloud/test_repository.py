@@ -38,6 +38,25 @@ class RecordingConnection:
         return self._connection.execute(query, parameters)
 
 
+class FailingSessionInsertConnection:
+    def __init__(self, connection: sqlite3.Connection):
+        self._connection = connection
+
+    def close(self) -> None:
+        self._connection.close()
+
+    def commit(self) -> None:
+        self._connection.commit()
+
+    def rollback(self) -> None:
+        self._connection.rollback()
+
+    def execute(self, query: str, parameters=()):
+        if "INSERT INTO sessions" in query:
+            raise sqlite3.OperationalError("injected session insert failure")
+        return self._connection.execute(query, parameters)
+
+
 @pytest.fixture
 def database(tmp_path: Path) -> Database:
     value = Database(tmp_path / "cloud.db")
@@ -52,6 +71,14 @@ def repository(database: Database) -> CloudRepository:
 
 def create_user(repository: CloudRepository, username: str):
     return repository.create_user(username, "argon2-password-hash", now=NOW)
+
+
+def registration_session(username: str) -> dict[str, object]:
+    return {
+        "session_token": f"session-token-for-{username}",
+        "csrf_token": f"csrf-token-for-{username}",
+        "session_expires_at": NOW + timedelta(hours=1),
+    }
 
 
 def test_users_are_normalized_unique_and_return_typed_records(
@@ -133,6 +160,7 @@ def test_invited_user_creation_rolls_back_invitation_on_duplicate_username(
             password_hash="first-password-hash",
             invitation_code=code,
             now=NOW,
+            **registration_session("existing-registration-user"),
         )
 
     registered = repository.register_user_with_invitation(
@@ -140,11 +168,15 @@ def test_invited_user_creation_rolls_back_invitation_on_duplicate_username(
         password_hash="second-password-hash",
         invitation_code=code,
         now=NOW,
+        **registration_session("new-registration-user"),
     )
 
     assert registered is not None
     assert registered.username == "new-registration-user"
     assert repository.get_user_by_username("new-registration-user") == registered
+    assert repository.get_active_session_by_token(
+        "session-token-for-new-registration-user", now=NOW
+    ).user_id == registered.id
 
 
 def test_invited_user_creation_is_single_use_under_concurrency(
@@ -162,6 +194,7 @@ def test_invited_user_creation_is_single_use_under_concurrency(
             password_hash=f"hash-for-{username}",
             invitation_code=code,
             now=NOW,
+            **registration_session(username),
         )
 
     with ThreadPoolExecutor(max_workers=2) as executor:
@@ -175,6 +208,49 @@ def test_invited_user_creation_is_single_use_under_concurrency(
         for username in ("concurrent-one", "concurrent-two")
     ]
     assert len([user for user in created if user is not None]) == 1
+
+
+def test_registration_rolls_back_user_and_invitation_when_session_insert_fails(
+    repository: CloudRepository,
+    database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    admin = create_user(repository, "rollback-registration-admin")
+    code = "rollback-registration-code"
+    repository.create_invitation(created_by=admin.id, code=code, now=NOW)
+    original_connection = database.connection
+
+    def failing_connection() -> FailingSessionInsertConnection:
+        return FailingSessionInsertConnection(original_connection())
+
+    monkeypatch.setattr(database, "connection", failing_connection)
+
+    with pytest.raises(sqlite3.OperationalError, match="session insert failure"):
+        repository.register_user_with_invitation(
+            username="rolled-back-registration-user",
+            password_hash="registration-password-hash",
+            invitation_code=code,
+            now=NOW,
+            **registration_session("rolled-back-registration-user"),
+        )
+
+    with original_connection() as connection:
+        user = connection.execute(
+            "SELECT id FROM users WHERE username = ?",
+            ("rolled-back-registration-user",),
+        ).fetchone()
+        invitation = connection.execute(
+            "SELECT used_by, used_at FROM invitations WHERE code_hash = ?",
+            (hash_secret(code),),
+        ).fetchone()
+        sessions = connection.execute(
+            "SELECT COUNT(*) FROM sessions WHERE token_hash = ?",
+            (hash_secret("session-token-for-rolled-back-registration-user"),),
+        ).fetchone()[0]
+
+    assert user is None
+    assert tuple(invitation) == (None, None)
+    assert sessions == 0
 
 
 def test_sessions_store_only_hashes_support_opaque_lookup_and_scoped_revocation(
@@ -205,6 +281,49 @@ def test_sessions_store_only_hashes_support_opaque_lookup_and_scoped_revocation(
     assert repository.revoke_session(user.id, session.id, now=NOW) is True
     assert repository.get_active_session_by_token(token, now=NOW) is None
     assert repository.get_session(user.id, session.id).revoked_at == NOW
+
+
+def test_password_change_rolls_back_password_and_revocations_if_new_session_fails(
+    repository: CloudRepository,
+    database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    user = create_user(repository, "password-rollback-user")
+    old_token = "password-rollback-old-session"
+    old_session = repository.create_session(
+        user.id,
+        token=old_token,
+        csrf_token="password-rollback-old-csrf",
+        expires_at=NOW + timedelta(hours=1),
+        now=NOW,
+    )
+    original_connection = database.connection
+
+    def failing_connection() -> FailingSessionInsertConnection:
+        return FailingSessionInsertConnection(original_connection())
+
+    monkeypatch.setattr(database, "connection", failing_connection)
+
+    with pytest.raises(sqlite3.OperationalError, match="session insert failure"):
+        repository.update_password_and_revoke_sessions(
+            user.id,
+            "replacement-password-hash",
+            expected_password_hash=user.password_hash,
+            token="password-rollback-new-session",
+            csrf_token="password-rollback-new-csrf",
+            expires_at=NOW + timedelta(hours=1),
+            now=NOW,
+        )
+
+    assert repository.get_user(user.id).password_hash == user.password_hash
+    assert repository.get_session(user.id, old_session.id).revoked_at is None
+    assert repository.get_active_session_by_token(old_token, now=NOW) is not None
+    assert (
+        repository.get_active_session_by_token(
+            "password-rollback-new-session", now=NOW
+        )
+        is None
+    )
 
 
 def test_tenant_owned_writes_read_back_by_id_and_user_id(

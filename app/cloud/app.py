@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -8,6 +10,7 @@ from app.cloud.config import CloudConfig
 from app.cloud.db import Database
 from app.cloud.repository import CloudRepository
 from app.cloud.routes import auth_router
+from app.cloud.routes.auth import REGISTRATION_LIMIT, REGISTRATION_WINDOW
 from app.cloud.security import KeyCipher, PasswordService, TokenService
 
 
@@ -49,6 +52,32 @@ def create_cloud_app(config: CloudConfig, database: Database) -> FastAPI:
     application.state.dummy_password_hash = password_service.hash(
         token_service.generate_session_token()
     )
+
+    @application.middleware("http")
+    async def claim_registration_submission(request: Request, call_next):
+        if request.method == "POST" and request.url.path == "/api/auth/register":
+            now = datetime.now(timezone.utc)
+            remote_addr = (
+                request.client.host if request.client is not None else "unknown"
+            )
+            try:
+                claimed = repository.claim_registration_submission(
+                    remote_addr=remote_addr,
+                    since=now - REGISTRATION_WINDOW,
+                    limit=REGISTRATION_LIMIT,
+                    now=now,
+                )
+            except Exception:
+                return JSONResponse(
+                    status_code=503,
+                    content={"detail": "Registration is temporarily unavailable"},
+                )
+            if not claimed:
+                return JSONResponse(
+                    status_code=429,
+                    content={"detail": "Too many registration attempts"},
+                )
+        return await call_next(request)
 
     @application.exception_handler(RequestValidationError)
     async def handle_validation_error(

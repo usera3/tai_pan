@@ -73,20 +73,67 @@ def _clear_session_cookie(response: Response) -> None:
     )
 
 
-def _start_session(request: Request, response: Response, user: User) -> AuthResponse:
+def _new_session_tokens(request: Request) -> tuple[str, str]:
     token_service = request.app.state.token_service
-    session_token = token_service.generate_session_token()
-    csrf_token = token_service.generate_csrf_token()
-    now = _now()
-    _repository(request).create_session(
-        user.id,
-        token=session_token,
-        csrf_token=csrf_token,
-        expires_at=now + SESSION_LIFETIME,
-        now=now,
+    return (
+        token_service.generate_session_token(),
+        token_service.generate_csrf_token(),
     )
+
+
+def _complete_authentication(
+    response: Response,
+    user: User,
+    *,
+    session_token: str,
+    csrf_token: str,
+) -> AuthResponse:
     _set_session_cookie(response, session_token)
     return AuthResponse(user=PublicUser.from_user(user), csrf_token=csrf_token)
+
+
+def _reject_failed_login(
+    repository: CloudRepository,
+    *,
+    username: str,
+    remote_addr: str,
+    since: datetime,
+    now: datetime,
+) -> None:
+    claimed = repository.claim_failed_login_attempt(
+        username=username,
+        remote_addr=remote_addr,
+        since=since,
+        limit=LOGIN_FAILURE_LIMIT,
+        now=now,
+    )
+    if not claimed:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many login attempts",
+        )
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail=GENERIC_LOGIN_ERROR,
+    )
+
+
+def _record_successful_login_audit(
+    repository: CloudRepository,
+    *,
+    username: str,
+    remote_addr: str,
+    now: datetime,
+) -> None:
+    try:
+        repository.record_auth_attempt(
+            username=username,
+            remote_addr=remote_addr,
+            successful=True,
+            now=now,
+        )
+    except Exception:
+        pass
 
 
 @router.post(
@@ -101,16 +148,7 @@ def register(
 ) -> AuthResponse:
     repository = _repository(request)
     now = _now()
-    remote_addr = _remote_addr(request)
-    if repository.count_registration_attempts(
-        since=now - REGISTRATION_WINDOW, remote_addr=remote_addr
-    ) >= REGISTRATION_LIMIT:
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="Too many registration attempts",
-        )
-
-    succeeded = False
+    session_token, csrf_token = _new_session_tokens(request)
     try:
         normalized_username = normalize_username(payload.username)
         _validate_new_password(payload.password)
@@ -119,6 +157,9 @@ def register(
             username=normalized_username,
             password_hash=password_hash,
             invitation_code=payload.invitation_code,
+            session_token=session_token,
+            csrf_token=csrf_token,
+            session_expires_at=now + SESSION_LIFETIME,
             now=now,
         )
         if user is None:
@@ -126,8 +167,12 @@ def register(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Registration could not be completed",
             )
-        succeeded = True
-        return _start_session(request, response, user)
+        return _complete_authentication(
+            response,
+            user,
+            session_token=session_token,
+            csrf_token=csrf_token,
+        )
     except ValueError:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -138,13 +183,6 @@ def register(
             status_code=status.HTTP_409_CONFLICT,
             detail="Username is unavailable",
         ) from None
-    finally:
-        repository.record_auth_attempt(
-            username=None,
-            remote_addr=remote_addr,
-            successful=succeeded,
-            now=now,
-        )
 
 
 @router.post("/login", response_model=AuthResponse)
@@ -183,25 +221,44 @@ def login(
         password_hash, payload.password
     )
     accepted = bool(verified and user is not None and user.status == "active")
-    repository.record_auth_attempt(
-        username=payload.username,
-        remote_addr=remote_addr,
-        successful=accepted,
-        now=now,
-    )
     if not accepted or user is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=GENERIC_LOGIN_ERROR,
+        _reject_failed_login(
+            repository,
+            username=payload.username,
+            remote_addr=remote_addr,
+            since=since,
+            now=now,
         )
 
-    user = repository.record_login(user.id, now=now)
-    if user is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=GENERIC_LOGIN_ERROR,
+    session_token, csrf_token = _new_session_tokens(request)
+    authenticated_user = repository.create_session_for_verified_user(
+        user.id,
+        expected_password_hash=user.password_hash,
+        token=session_token,
+        csrf_token=csrf_token,
+        expires_at=now + SESSION_LIFETIME,
+        now=now,
+    )
+    if authenticated_user is None:
+        _reject_failed_login(
+            repository,
+            username=payload.username,
+            remote_addr=remote_addr,
+            since=since,
+            now=now,
         )
-    return _start_session(request, response, user)
+    _record_successful_login_audit(
+        repository,
+        username=payload.username,
+        remote_addr=remote_addr,
+        now=now,
+    )
+    return _complete_authentication(
+        response,
+        authenticated_user,
+        session_token=session_token,
+        csrf_token=csrf_token,
+    )
 
 
 @router.get("/me", response_model=MeResponse)
@@ -245,12 +302,25 @@ def change_password(
         )
     _validate_new_password(payload.new_password)
     password_hash = request.app.state.password_service.hash(payload.new_password)
+    now = _now()
+    session_token, csrf_token = _new_session_tokens(request)
     updated = _repository(request).update_password_and_revoke_sessions(
-        user.id, password_hash
+        user.id,
+        password_hash,
+        expected_password_hash=user.password_hash,
+        token=session_token,
+        csrf_token=csrf_token,
+        expires_at=now + SESSION_LIFETIME,
+        now=now,
     )
     if updated is None:
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Authentication required",
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Password could not be changed",
         )
-    return _start_session(request, response, updated)
+    return _complete_authentication(
+        response,
+        updated,
+        session_token=session_token,
+        csrf_token=csrf_token,
+    )

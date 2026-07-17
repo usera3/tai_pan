@@ -220,6 +220,42 @@ def _auth_attempt_from_row(row: sqlite3.Row) -> AuthAttempt:
     )
 
 
+def _insert_session(
+    connection: sqlite3.Connection,
+    user_id: str,
+    *,
+    token: str,
+    csrf_token: str,
+    expires_at: datetime,
+    timestamp: datetime,
+) -> sqlite3.Row:
+    session_id = str(uuid4())
+    connection.execute(
+        """
+        INSERT INTO sessions (
+            id, user_id, token_hash, csrf_hash, created_at,
+            expires_at, last_seen_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            session_id,
+            user_id,
+            hash_secret(token),
+            hash_secret(csrf_token),
+            _serialize_datetime(timestamp),
+            _serialize_datetime(expires_at),
+            _serialize_datetime(timestamp),
+        ),
+    )
+    row = connection.execute(
+        "SELECT * FROM sessions WHERE id = ? AND user_id = ?",
+        (session_id, user_id),
+    ).fetchone()
+    if row is None:
+        raise RuntimeError("session insert could not be read back")
+    return row
+
+
 class CloudRepository:
     def __init__(self, database: Database, key_cipher: KeyCipher) -> None:
         self._database = database
@@ -350,6 +386,9 @@ class CloudRepository:
         username: str,
         password_hash: str,
         invitation_code: str,
+        session_token: str,
+        csrf_token: str,
+        session_expires_at: datetime,
         now: datetime | None = None,
     ) -> User | None:
         timestamp = now or _now()
@@ -396,6 +435,14 @@ class CloudRepository:
                 )
                 if cursor.rowcount != 1:
                     raise RuntimeError("invitation could not be consumed")
+                _insert_session(
+                    connection,
+                    user_id,
+                    token=session_token,
+                    csrf_token=csrf_token,
+                    expires_at=session_expires_at,
+                    timestamp=timestamp,
+                )
                 row = connection.execute(
                     "SELECT * FROM users WHERE id = ?", (user_id,)
                 ).fetchone()
@@ -410,9 +457,14 @@ class CloudRepository:
         user_id: str,
         password_hash: str,
         *,
+        expected_password_hash: str,
+        token: str,
+        csrf_token: str,
+        expires_at: datetime,
         now: datetime | None = None,
     ) -> User | None:
-        serialized_now = _serialize_datetime(now or _now())
+        timestamp = now or _now()
+        serialized_now = _serialize_datetime(timestamp)
         with closing(self._database.connection()) as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
@@ -420,9 +472,14 @@ class CloudRepository:
                     """
                     UPDATE users
                     SET password_hash = ?, must_change_password = 0, updated_at = ?
-                    WHERE id = ?
+                    WHERE id = ? AND status = 'active' AND password_hash = ?
                     """,
-                    (password_hash, serialized_now, user_id),
+                    (
+                        password_hash,
+                        serialized_now,
+                        user_id,
+                        expected_password_hash,
+                    ),
                 )
                 if cursor.rowcount != 1:
                     connection.rollback()
@@ -433,6 +490,56 @@ class CloudRepository:
                     WHERE user_id = ? AND revoked_at IS NULL
                     """,
                     (serialized_now, user_id),
+                )
+                _insert_session(
+                    connection,
+                    user_id,
+                    token=token,
+                    csrf_token=csrf_token,
+                    expires_at=expires_at,
+                    timestamp=timestamp,
+                )
+                row = connection.execute(
+                    "SELECT * FROM users WHERE id = ?", (user_id,)
+                ).fetchone()
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        return _user_from_row(row)
+
+    def create_session_for_verified_user(
+        self,
+        user_id: str,
+        *,
+        expected_password_hash: str,
+        token: str,
+        csrf_token: str,
+        expires_at: datetime,
+        now: datetime | None = None,
+    ) -> User | None:
+        timestamp = now or _now()
+        serialized_now = _serialize_datetime(timestamp)
+        with closing(self._database.connection()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = connection.execute(
+                    """
+                    UPDATE users SET last_login_at = ?
+                    WHERE id = ? AND status = 'active' AND password_hash = ?
+                    """,
+                    (serialized_now, user_id, expected_password_hash),
+                )
+                if cursor.rowcount != 1:
+                    connection.rollback()
+                    return None
+                _insert_session(
+                    connection,
+                    user_id,
+                    token=token,
+                    csrf_token=csrf_token,
+                    expires_at=expires_at,
+                    timestamp=timestamp,
                 )
                 row = connection.execute(
                     "SELECT * FROM users WHERE id = ?", (user_id,)
@@ -466,29 +573,15 @@ class CloudRepository:
         now: datetime | None = None,
     ) -> Session:
         timestamp = now or _now()
-        session_id = str(uuid4())
         with closing(self._database.connection()) as connection, connection:
-            connection.execute(
-                """
-                INSERT INTO sessions (
-                    id, user_id, token_hash, csrf_hash, created_at,
-                    expires_at, last_seen_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    session_id,
-                    user_id,
-                    hash_secret(token),
-                    hash_secret(csrf_token),
-                    _serialize_datetime(timestamp),
-                    _serialize_datetime(expires_at),
-                    _serialize_datetime(timestamp),
-                ),
+            row = _insert_session(
+                connection,
+                user_id,
+                token=token,
+                csrf_token=csrf_token,
+                expires_at=expires_at,
+                timestamp=timestamp,
             )
-            row = connection.execute(
-                "SELECT * FROM sessions WHERE id = ? AND user_id = ?",
-                (session_id, user_id),
-            ).fetchone()
         return _session_from_row(row)
 
     def get_active_session_by_token(
@@ -857,6 +950,97 @@ class CloudRepository:
                 "SELECT * FROM auth_attempts WHERE id = ?", (attempt_id,)
             ).fetchone()
         return _auth_attempt_from_row(row)
+
+    def claim_failed_login_attempt(
+        self,
+        *,
+        username: str,
+        remote_addr: str,
+        since: datetime,
+        limit: int,
+        now: datetime | None = None,
+    ) -> bool:
+        if limit < 1:
+            raise ValueError("limit must be positive")
+        normalized_username = _normalize_auth_identifier(username)
+        serialized_since = _serialize_datetime(since)
+        timestamp = now or _now()
+        with closing(self._database.connection()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                account_count = connection.execute(
+                    """
+                    SELECT COUNT(*) FROM auth_attempts
+                    WHERE successful = 0 AND username = ? AND created_at >= ?
+                    """,
+                    (normalized_username, serialized_since),
+                ).fetchone()[0]
+                ip_count = connection.execute(
+                    """
+                    SELECT COUNT(*) FROM auth_attempts
+                    WHERE successful = 0 AND remote_addr = ? AND created_at >= ?
+                    """,
+                    (remote_addr, serialized_since),
+                ).fetchone()[0]
+                if account_count >= limit or ip_count >= limit:
+                    connection.rollback()
+                    return False
+                connection.execute(
+                    """
+                    INSERT INTO auth_attempts (
+                        id, username, remote_addr, successful, created_at
+                    ) VALUES (?, ?, ?, 0, ?)
+                    """,
+                    (
+                        str(uuid4()),
+                        normalized_username,
+                        remote_addr,
+                        _serialize_datetime(timestamp),
+                    ),
+                )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        return True
+
+    def claim_registration_submission(
+        self,
+        *,
+        remote_addr: str,
+        since: datetime,
+        limit: int,
+        now: datetime | None = None,
+    ) -> bool:
+        if limit < 1:
+            raise ValueError("limit must be positive")
+        timestamp = now or _now()
+        with closing(self._database.connection()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                count = connection.execute(
+                    """
+                    SELECT COUNT(*) FROM auth_attempts
+                    WHERE username IS NULL AND remote_addr = ? AND created_at >= ?
+                    """,
+                    (remote_addr, _serialize_datetime(since)),
+                ).fetchone()[0]
+                if count >= limit:
+                    connection.rollback()
+                    return False
+                connection.execute(
+                    """
+                    INSERT INTO auth_attempts (
+                        id, username, remote_addr, successful, created_at
+                    ) VALUES (?, NULL, ?, 0, ?)
+                    """,
+                    (str(uuid4()), remote_addr, _serialize_datetime(timestamp)),
+                )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        return True
 
     def count_failed_auth_attempts(
         self,
