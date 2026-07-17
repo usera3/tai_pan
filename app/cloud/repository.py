@@ -109,6 +109,10 @@ def normalize_username(username: str) -> str:
     return normalized
 
 
+def _normalize_auth_identifier(username: str) -> str:
+    return username.strip().lower()
+
+
 def _now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -370,7 +374,8 @@ class CloudRepository:
                 ),
             )
             row = connection.execute(
-                "SELECT * FROM sessions WHERE id = ?", (session_id,)
+                "SELECT * FROM sessions WHERE id = ? AND user_id = ?",
+                (session_id, user_id),
             ).fetchone()
         return _session_from_row(row)
 
@@ -526,7 +531,8 @@ class CloudRepository:
                 ),
             )
             row = connection.execute(
-                "SELECT * FROM cloud_files WHERE id = ?", (file_id,)
+                "SELECT * FROM cloud_files WHERE id = ? AND user_id = ?",
+                (file_id, user_id),
             ).fetchone()
         return _cloud_file_from_row(row)
 
@@ -685,9 +691,16 @@ class CloudRepository:
                     _serialize_datetime(now or _now()),
                 ),
             )
-            row = connection.execute(
-                "SELECT * FROM audit_events WHERE id = ?", (event_id,)
-            ).fetchone()
+            if user_id is None:
+                row = connection.execute(
+                    "SELECT * FROM audit_events WHERE id = ? AND user_id IS NULL",
+                    (event_id,),
+                ).fetchone()
+            else:
+                row = connection.execute(
+                    "SELECT * FROM audit_events WHERE id = ? AND user_id = ?",
+                    (event_id, user_id),
+                ).fetchone()
         return _audit_event_from_row(row)
 
     def list_audit_events(self, user_id: str) -> list[AuditEvent]:
@@ -710,7 +723,9 @@ class CloudRepository:
         now: datetime | None = None,
     ) -> AuthAttempt:
         attempt_id = str(uuid4())
-        normalized_username = normalize_username(username) if username else None
+        normalized_username = (
+            _normalize_auth_identifier(username) if username is not None else None
+        )
         with closing(self._database.connection()) as connection, connection:
             connection.execute(
                 """
@@ -744,7 +759,7 @@ class CloudRepository:
         parameters = [_serialize_datetime(since)]
         if username is not None:
             clauses.append("username = ?")
-            parameters.append(normalize_username(username))
+            parameters.append(_normalize_auth_identifier(username))
         if remote_addr is not None:
             clauses.append("remote_addr = ?")
             parameters.append(remote_addr)

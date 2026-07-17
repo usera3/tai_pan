@@ -71,3 +71,30 @@ def test_key_cipher_wrong_key_failure_redacts_all_sensitive_values():
     assert encrypted not in rendered
     assert first_key.decode("ascii") not in rendered
     assert second_key.decode("ascii") not in rendered
+
+
+@pytest.mark.parametrize(
+    ("operation", "sensitive_value"),
+    [
+        (lambda value: KeyCipher(value), "key-\ud800-secret"),
+        (
+            lambda value: KeyCipher(Fernet.generate_key()).encrypt(value),
+            "tmp-key-\ud800-secret",
+        ),
+        (lambda value: hash_secret(value), "token-\ud800-secret"),
+    ],
+    ids=("key", "tmp-key", "secret-hash"),
+)
+def test_secret_encoding_failures_are_redacted_value_errors(
+    operation, sensitive_value: str
+):
+    with pytest.raises(ValueError) as captured:
+        operation(sensitive_value)
+
+    error = captured.value
+    assert type(error) is ValueError
+    assert str(error) == "unable to encode protected value"
+    assert sensitive_value not in repr(error)
+    assert sensitive_value not in str(error)
+    assert error.__context__ is None
+    assert error.__cause__ is None

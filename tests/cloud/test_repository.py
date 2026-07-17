@@ -18,6 +18,26 @@ from app.cloud.security import KeyCipher, hash_secret
 NOW = datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc)
 
 
+class RecordingConnection:
+    def __init__(self, connection: sqlite3.Connection, queries: list[tuple[str, object]]):
+        self._connection = connection
+        self._queries = queries
+
+    def __enter__(self):
+        self._connection.__enter__()
+        return self
+
+    def __exit__(self, *args):
+        return self._connection.__exit__(*args)
+
+    def close(self) -> None:
+        self._connection.close()
+
+    def execute(self, query: str, parameters=()):
+        self._queries.append((query, parameters))
+        return self._connection.execute(query, parameters)
+
+
 @pytest.fixture
 def database(tmp_path: Path) -> Database:
     value = Database(tmp_path / "cloud.db")
@@ -127,6 +147,63 @@ def test_sessions_store_only_hashes_support_opaque_lookup_and_scoped_revocation(
     assert repository.revoke_session(user.id, session.id, now=NOW) is True
     assert repository.get_active_session_by_token(token, now=NOW) is None
     assert repository.get_session(user.id, session.id).revoked_at == NOW
+
+
+def test_tenant_owned_writes_read_back_by_id_and_user_id(
+    repository: CloudRepository, database: Database, monkeypatch: pytest.MonkeyPatch
+):
+    user = create_user(repository, "write-owner")
+    queries: list[tuple[str, object]] = []
+    original_connection = database.connection
+
+    def recording_connection() -> RecordingConnection:
+        return RecordingConnection(original_connection(), queries)
+
+    monkeypatch.setattr(database, "connection", recording_connection)
+
+    session = repository.create_session(
+        user.id,
+        token="session-token",
+        csrf_token="csrf-token",
+        expires_at=NOW + timedelta(hours=1),
+        now=NOW,
+    )
+    cloud_file = repository.create_cloud_file(
+        user.id,
+        original_name="report.pdf",
+        content_type="application/pdf",
+        size_bytes=123,
+        storage_path=f"{user.id}/stored-file",
+        sha256="a" * 64,
+        now=NOW,
+    )
+    event = repository.create_audit_event(
+        user.id,
+        event_type="file.created",
+        target_type="cloud_file",
+        target_id=cloud_file.id,
+        now=NOW,
+    )
+
+    reads = [
+        (query, parameters)
+        for query, parameters in queries
+        if "SELECT * FROM sessions" in query
+        or "SELECT * FROM cloud_files" in query
+        or "SELECT * FROM audit_events" in query
+    ]
+
+    assert reads == [
+        ("SELECT * FROM sessions WHERE id = ? AND user_id = ?", (session.id, user.id)),
+        (
+            "SELECT * FROM cloud_files WHERE id = ? AND user_id = ?",
+            (cloud_file.id, user.id),
+        ),
+        (
+            "SELECT * FROM audit_events WHERE id = ? AND user_id = ?",
+            (event.id, user.id),
+        ),
+    ]
 
 
 def test_settings_encrypt_tmp_key_and_expose_only_configuration_status(
@@ -269,4 +346,26 @@ def test_audit_events_and_rate_limit_attempts_return_typed_records(
     ) == 1
     assert repository.count_failed_auth_attempts(
         since=NOW - timedelta(minutes=15), remote_addr="203.0.113.10"
+    ) == 1
+
+
+def test_auth_attempts_record_invalid_login_identifiers_for_ip_rate_limiting(
+    repository: CloudRepository,
+):
+    login_identifier = "  invalid login name!  "
+    remote_addr = "203.0.113.77"
+
+    attempt = repository.record_auth_attempt(
+        username=login_identifier,
+        remote_addr=remote_addr,
+        successful=False,
+        now=NOW,
+    )
+
+    assert attempt.username == "invalid login name!"
+    assert repository.count_failed_auth_attempts(
+        since=NOW - timedelta(minutes=15), username=login_identifier
+    ) == 1
+    assert repository.count_failed_auth_attempts(
+        since=NOW - timedelta(minutes=15), remote_addr=remote_addr
     ) == 1

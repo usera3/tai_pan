@@ -12,6 +12,14 @@ class SecretDecryptionError(ValueError):
     """Raised when protected data cannot be authenticated and decrypted."""
 
 
+def _encode_protected_value(value: str, encoding: str) -> bytes:
+    try:
+        return value.encode(encoding)
+    except UnicodeError:
+        pass
+    raise ValueError("unable to encode protected value")
+
+
 class PasswordService:
     def __init__(self) -> None:
         self._hasher = PasswordHasher()
@@ -31,11 +39,13 @@ class PasswordService:
 
 class KeyCipher:
     def __init__(self, key: str | bytes) -> None:
-        encoded_key = key.encode("ascii") if isinstance(key, str) else key
+        encoded_key = _encode_protected_value(key, "ascii") if isinstance(key, str) else key
         self._fernet = Fernet(encoded_key)
 
     def encrypt(self, value: str) -> str:
-        return self._fernet.encrypt(value.encode("utf-8")).decode("ascii")
+        return self._fernet.encrypt(_encode_protected_value(value, "utf-8")).decode(
+            "ascii"
+        )
 
     def decrypt(self, encrypted_value: str) -> str:
         try:
@@ -59,4 +69,4 @@ class TokenService:
 
 
 def hash_secret(value: str) -> str:
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+    return hashlib.sha256(_encode_protected_value(value, "utf-8")).hexdigest()
