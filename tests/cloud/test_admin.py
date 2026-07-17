@@ -4,6 +4,7 @@ import json
 import os
 import fcntl
 import sqlite3
+import selectors
 import stat
 import subprocess
 import sys
@@ -735,42 +736,58 @@ def test_initial_admin_bootstrap_never_overwrites_existing_admin_or_credentials(
     assert temporary_password not in lock_path.read_text(encoding="utf-8")
 
 
-def test_initial_admin_cli_blocks_on_cross_process_lock(tmp_path: Path):
-    database_path = tmp_path / "blocked-bootstrap.db"
+def test_bootstrap_lock_blocks_across_processes_after_child_is_ready(tmp_path: Path):
     credentials_file = tmp_path / "blocked-bootstrap.json"
     lock_path = credentials_file.with_name(f".{credentials_file.name}.lock")
     lock_path.touch(mode=0o600)
     lock_path.chmod(0o600)
     lock_descriptor = os.open(lock_path, os.O_RDWR)
     fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
+    child_script = """
+import os
+import sys
+from pathlib import Path
+from app.cloud.admin_cli import (
+    _acquire_bootstrap_lock,
+    _lock_name,
+    _open_credentials_directory,
+)
+
+path = Path(sys.argv[1])
+directory_fd = _open_credentials_directory(path)
+print("ready", flush=True)
+lock = _acquire_bootstrap_lock(directory_fd, _lock_name(path.name))
+print("acquired", flush=True)
+lock.close()
+os.close(directory_fd)
+"""
     process = subprocess.Popen(
         [
             sys.executable,
-            "-m",
-            "app.cloud.admin_cli",
-            "--database-path",
-            str(database_path),
-            "--username",
-            "bootstrap-admin",
-            "--credentials-file",
+            "-c",
+            child_script,
             str(credentials_file),
         ],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
     )
+    selector = selectors.DefaultSelector()
     try:
-        with pytest.raises(subprocess.TimeoutExpired):
-            process.wait(timeout=0.25)
+        assert process.stdout is not None
+        assert process.stdout.readline().strip() == "ready"
+        selector.register(process.stdout, selectors.EVENT_READ)
+        assert selector.select(timeout=0.25) == []
     finally:
         fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
         os.close(lock_descriptor)
 
+    assert process.stdout.readline().strip() == "acquired"
     stdout, stderr = process.communicate(timeout=30)
+    selector.close()
     assert process.returncode == 0
-    credentials = json.loads(credentials_file.read_text(encoding="utf-8"))
-    assert credentials["temporary_password"] not in stdout
-    assert credentials["temporary_password"] not in stderr
+    assert stdout == ""
+    assert stderr == ""
 
 
 def test_initial_admin_bootstrap_rolls_back_when_credential_write_fails(
