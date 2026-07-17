@@ -1,6 +1,10 @@
 .worktrees/
 .venv/
 .local/
+.env
+deploy/.env
+data/
+rollback/
 __pycache__/
 *.py[cod]
 .pytest_cache/
