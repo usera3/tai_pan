@@ -319,6 +319,84 @@ class CloudRepository:
             ).fetchall()
         return [_user_from_row(row) for row in rows]
 
+    def set_user_status_and_revoke_sessions(
+        self,
+        user_id: str,
+        status: str,
+        *,
+        now: datetime | None = None,
+    ) -> User | None:
+        if status not in {"active", "disabled"}:
+            raise ValueError("unsupported user status")
+        serialized_now = _serialize_datetime(now or _now())
+        with closing(self._database.connection()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = connection.execute(
+                    """
+                    UPDATE users SET status = ?, updated_at = ?
+                    WHERE id = ? AND role = 'user'
+                    """,
+                    (status, serialized_now, user_id),
+                )
+                if cursor.rowcount != 1:
+                    connection.rollback()
+                    return None
+                if status == "disabled":
+                    connection.execute(
+                        """
+                        UPDATE sessions SET revoked_at = ?
+                        WHERE user_id = ? AND revoked_at IS NULL
+                        """,
+                        (serialized_now, user_id),
+                    )
+                row = connection.execute(
+                    "SELECT * FROM users WHERE id = ?", (user_id,)
+                ).fetchone()
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        return _user_from_row(row)
+
+    def reset_user_password_and_revoke_sessions(
+        self,
+        user_id: str,
+        password_hash: str,
+        *,
+        now: datetime | None = None,
+    ) -> User | None:
+        serialized_now = _serialize_datetime(now or _now())
+        with closing(self._database.connection()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = connection.execute(
+                    """
+                    UPDATE users
+                    SET password_hash = ?, must_change_password = 1, updated_at = ?
+                    WHERE id = ? AND role = 'user'
+                    """,
+                    (password_hash, serialized_now, user_id),
+                )
+                if cursor.rowcount != 1:
+                    connection.rollback()
+                    return None
+                connection.execute(
+                    """
+                    UPDATE sessions SET revoked_at = ?
+                    WHERE user_id = ? AND revoked_at IS NULL
+                    """,
+                    (serialized_now, user_id),
+                )
+                row = connection.execute(
+                    "SELECT * FROM users WHERE id = ?", (user_id,)
+                ).fetchone()
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        return _user_from_row(row)
+
     def create_invitation(
         self,
         *,
@@ -348,6 +426,39 @@ class CloudRepository:
                 "SELECT * FROM invitations WHERE id = ?", (invitation_id,)
             ).fetchone()
         return _invitation_from_row(row)
+
+    def list_invitations(self) -> list[Invitation]:
+        with closing(self._database.connection()) as connection:
+            rows = connection.execute(
+                "SELECT * FROM invitations ORDER BY created_at, id"
+            ).fetchall()
+        return [_invitation_from_row(row) for row in rows]
+
+    def revoke_unused_invitation(self, invitation_id: str) -> str:
+        with closing(self._database.connection()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = connection.execute(
+                    "SELECT used_by FROM invitations WHERE id = ?",
+                    (invitation_id,),
+                ).fetchone()
+                if row is None:
+                    connection.rollback()
+                    return "not_found"
+                if row["used_by"] is not None:
+                    connection.rollback()
+                    return "used"
+                cursor = connection.execute(
+                    "DELETE FROM invitations WHERE id = ? AND used_by IS NULL",
+                    (invitation_id,),
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError("invitation could not be revoked")
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        return "revoked"
 
     def consume_invitation(
         self, code: str, *, used_by: str, now: datetime | None = None

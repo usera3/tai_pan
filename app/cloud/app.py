@@ -9,7 +9,7 @@ from fastapi.responses import JSONResponse
 from app.cloud.config import CloudConfig
 from app.cloud.db import Database
 from app.cloud.repository import CloudRepository
-from app.cloud.routes import auth_router
+from app.cloud.routes import admin_router, auth_router
 from app.cloud.routes.auth import REGISTRATION_LIMIT, REGISTRATION_WINDOW
 from app.cloud.security import KeyCipher, PasswordService, TokenService
 
@@ -93,4 +93,5 @@ def create_cloud_app(config: CloudConfig, database: Database) -> FastAPI:
         return {"status": "ok"}
 
     application.include_router(auth_router)
+    application.include_router(admin_router)
     return application
