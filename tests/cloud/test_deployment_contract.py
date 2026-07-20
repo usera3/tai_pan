@@ -86,6 +86,11 @@ def test_compose_is_an_explicit_isolated_project_with_fixed_proxy_peer():
     assert "ipv4_address: 10.203.187.3" in compose
     assert "app.cloud.maintenance" in compose
     assert "daily" in compose
+    assert re.search(
+        r"^\s{2}backup:.*?^\s{4}healthcheck:\s*\n\s{6}disable:\s*true\s*$",
+        compose,
+        re.MULTILINE | re.DOTALL,
+    )
 
 
 def test_deployment_assets_contain_no_embedded_secrets():

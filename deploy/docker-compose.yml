@@ -97,6 +97,8 @@ services:
 
   backup:
     image: tai-pan-cloud:latest
+    healthcheck:
+      disable: true
     command:
       - python
       - -m
