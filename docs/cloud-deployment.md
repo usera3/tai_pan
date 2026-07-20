@@ -105,7 +105,8 @@ root-controlled Certbot deploy hook that runs `nginx -t` before reload. Verify
 the renewal path after TLS is live:
 
 ```bash
-sudo certbot renew --dry-run --run-deploy-hooks
+sudo certbot renew --cert-name cloud.claudcode.xyz --dry-run
+sudo /etc/letsencrypt/renewal-hooks/deploy/tai-pan-cloud-nginx-reload
 ```
 
 A failed certificate request leaves the HTTP-only staging site in place; it

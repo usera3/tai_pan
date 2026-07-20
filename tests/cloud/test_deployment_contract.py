@@ -351,7 +351,8 @@ def test_operations_guide_covers_required_production_procedures():
     )
     for text in required_text:
         assert text in docs
-    assert "certbot renew --dry-run --run-deploy-hooks" in docs
+    assert "certbot renew --cert-name cloud.claudcode.xyz --dry-run" in docs
+    assert "/etc/letsencrypt/renewal-hooks/deploy/tai-pan-cloud-nginx-reload" in docs
     assert "data/backups/manual/app-" in docs
     assert ".proxy-secret" in docs
     assert "runtime-secrets" in docs
