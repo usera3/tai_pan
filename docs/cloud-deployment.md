@@ -17,6 +17,8 @@ Docker network, Nginx site, database, or MQTT service.
 - A non-root Nginx file-proxy sidecar at `10.203.187.3` owns the localhost
   listener and reads the permanent-file mount read-only. Uvicorn has no host
   port and trusts proxy headers only from this fixed sidecar address.
+- The sidecar configuration is baked into `tai-pan-file-proxy:latest`; the
+  prior app and sidecar images are both tagged before an upgrade.
 - The host and sidecar authenticate their private proxy hop with a random
   server-generated header. The header and application secrets are never
   committed or printed.
@@ -68,7 +70,10 @@ root-owned `data` parent is not writable by containers. Before starting a new
 image, an existing database is copied atomically with the SQLite Backup API to
 `data/pre-deploy`, must pass `PRAGMA integrity_check`, and is retained for five
 deployments. A failed switch restores that snapshot, retags the prior image,
-and recreates the prior project services.
+and recreates the prior project services. Public traffic receives `503` from
+a dedicated maintenance Nginx site from before the database snapshot until
+the app, file proxy, and backup service are ready, so no writes can land in the
+rollback window.
 
 The script creates `.env` and `.proxy-secret` directly with mode `0600`.
 `SESSION_SECRET`, `KEY_ENCRYPTION_KEY`, and the proxy token are generated on

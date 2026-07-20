@@ -12,7 +12,9 @@ COMPOSE = ROOT / "deploy" / "docker-compose.yml"
 ENV_EXAMPLE = ROOT / "deploy" / "env.example"
 NGINX = ROOT / "deploy" / "nginx" / "cloud.claudcode.xyz.conf"
 FILE_PROXY_NGINX = ROOT / "deploy" / "nginx" / "file-proxy.conf"
+FILE_PROXY_DOCKERFILE = ROOT / "deploy" / "nginx" / "Dockerfile"
 HTTP_NGINX = ROOT / "deploy" / "nginx" / "cloud.claudcode.xyz.http.conf"
+MAINTENANCE_NGINX = ROOT / "deploy" / "nginx" / "cloud.claudcode.xyz.maintenance.conf"
 CERTBOT_HOOK = ROOT / "deploy" / "certbot-nginx-reload.sh"
 DEPLOY = ROOT / "deploy" / "deploy.sh"
 DOCS = ROOT / "docs" / "cloud-deployment.md"
@@ -39,6 +41,9 @@ def test_container_is_nonroot_single_worker_and_health_checked():
     assert "source: /home/ubuntu/tai-pan-cloud/data/backups" in compose
     assert "source: /home/ubuntu/tai-pan-cloud/data/credentials" in compose
     assert "source: /home/ubuntu/tai-pan-cloud/data\n" not in compose
+    assert "image: tai-pan-file-proxy:latest" in compose
+    assert "dockerfile: Dockerfile" in compose
+    assert "target: /etc/nginx/nginx.conf" not in compose
 
 
 def test_compose_is_an_explicit_isolated_project_with_fixed_proxy_peer():
@@ -88,7 +93,9 @@ def test_deployment_assets_contain_no_embedded_secrets():
             ENV_EXAMPLE,
             NGINX,
             FILE_PROXY_NGINX,
+            FILE_PROXY_DOCKERFILE,
             HTTP_NGINX,
+            MAINTENANCE_NGINX,
             CERTBOT_HOOK,
             DOCS,
         )
@@ -154,16 +161,26 @@ def test_deploy_script_is_target_locked_secret_safe_and_project_scoped():
     assert ".pending-" in script
     assert "os.replace" in script
     assert "PREDEPLOY_RETENTION" in script
-    assert "rollback_application_on_error" in script
+    assert "rollback_deployment" in script
     assert "--force-recreate app file_proxy backup" in script
+    assert "tai-pan-file-proxy:rollback-" in script
+    assert "CURRENT_PROXY_CONTAINER" in script
+    assert "compose build app file_proxy" in script
+    assert "compose pull file_proxy" not in script
+    assert "enter_maintenance_site" in script
+    assert script.index("\nenter_maintenance_site\n") < main_stop
+    main_health = script.rindex(
+        "if curl --fail --silent --show-error http://127.0.0.1:18765/health"
+    )
+    main_commit = script.rindex('commit_nginx_site "$NGINX_TLS_SOURCE"')
+    assert main_health < main_commit
+    assert "rollback health check failed" in script
+    assert "compose up -d --force-recreate app file_proxy backup || true" not in script
     assert "tai-pan-cloud-upstream-auth.conf" in script
     assert "certbot-nginx-reload" in script
     assert 'PROJECT=tai-pan-cloud' in script
     assert 'docker compose --project-name "$PROJECT"' in script
     assert "curl --fail --silent --show-error http://127.0.0.1:18765/health" in script
-    assert script.index("127.0.0.1:18765/health") < script.index(
-        'install_nginx_site "$NGINX_HTTP_SOURCE"'
-    )
     assert "docker prune" not in script
     assert "docker system" not in script
     assert "docker stop" not in script
@@ -174,10 +191,13 @@ def test_deploy_script_is_target_locked_secret_safe_and_project_scoped():
 def test_tls_assets_are_staged_and_renewed_with_validation():
     deploy = _read(DEPLOY)
     http_nginx = _read(HTTP_NGINX)
+    maintenance_nginx = _read(MAINTENANCE_NGINX)
     hook = _read(CERTBOT_HOOK)
 
     assert "listen 80;" in http_nginx
     assert "ssl_certificate" not in http_nginx
+    assert "listen 443 ssl;" in maintenance_nginx
+    assert "return 503;" in maintenance_nginx
     assert "restore_nginx_files" in deploy
     assert "trap" in deploy
     assert "nginx -t" in hook

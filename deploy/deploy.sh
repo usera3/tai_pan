@@ -10,6 +10,7 @@ PROXY_TOKEN_FILE="$TARGET/.proxy-secret"
 PROXY_AUTH_FILE="$TARGET/runtime-secrets/file-proxy-auth.conf"
 NGINX_TLS_SOURCE="$TARGET/deploy/nginx/cloud.claudcode.xyz.conf"
 NGINX_HTTP_SOURCE="$TARGET/deploy/nginx/cloud.claudcode.xyz.http.conf"
+NGINX_MAINTENANCE_SOURCE="$TARGET/deploy/nginx/cloud.claudcode.xyz.maintenance.conf"
 CERTBOT_HOOK_SOURCE="$TARGET/deploy/certbot-nginx-reload.sh"
 NGINX_AVAILABLE=/etc/nginx/sites-available/cloud.claudcode.xyz
 NGINX_ENABLED=/etc/nginx/sites-enabled/cloud.claudcode.xyz
@@ -20,14 +21,17 @@ ROLLBACK_DIR="$TARGET/rollback/$(date -u +%Y%m%dT%H%M%SZ)"
 PREDEPLOY_RETENTION=5
 PREDEPLOY_SNAPSHOT=
 ROLLBACK_TAG=
+PROXY_ROLLBACK_TAG=
 HAD_RUNNING_APP=0
+HAD_RUNNING_PROXY=0
 APP_SWITCH_ACTIVE=0
 NGINX_BACKUP_READY=0
 
 fail() {
     printf 'Deployment error: %s\n' "$1" >&2
-    if [[ ${APP_SWITCH_ACTIVE:-0} -eq 1 ]]; then
-        restore_previous_application
+    if [[ ${APP_SWITCH_ACTIVE:-0} -eq 1 || ${NGINX_BACKUP_READY:-0} -eq 1 ]]; then
+        trap - ERR
+        rollback_deployment || true
     fi
     exit 1
 }
@@ -48,8 +52,8 @@ reject_legacy_layout() {
 restore_previous_application() {
     [[ $APP_SWITCH_ACTIVE -eq 1 ]] || return 0
     APP_SWITCH_ACTIVE=0
+    compose stop app file_proxy backup || true
     if [[ $HAD_RUNNING_APP -eq 1 ]]; then
-        compose stop app file_proxy backup || true
         if [[ -n "$PREDEPLOY_SNAPSHOT" ]]; then
             rm -f -- "$TARGET/data/database/.app.db.rollback-restore"
             install -m 0600 -o 10001 -g 10001 "$PREDEPLOY_SNAPSHOT" \
@@ -59,15 +63,35 @@ restore_previous_application() {
             rm -f -- "$TARGET/data/database/app.db-wal" "$TARGET/data/database/app.db-shm"
         fi
         docker image tag "$ROLLBACK_TAG" tai-pan-cloud:latest
-        compose up -d --force-recreate app file_proxy backup || true
+        docker image tag "$PROXY_ROLLBACK_TAG" tai-pan-file-proxy:latest
+        if ! compose up -d --force-recreate app file_proxy backup; then
+            printf '%s\n' "Deployment rollback failed to restart the prior services." >&2
+            return 1
+        fi
+        for _ in $(seq 1 60); do
+            if curl --fail --silent --show-error http://127.0.0.1:18765/health >/dev/null; then
+                return 0
+            fi
+            sleep 2
+        done
+        printf '%s\n' "Deployment rollback health check failed." >&2
+        return 1
     fi
+    return 0
 }
 
-rollback_application_on_error() {
-    local status=$?
-    trap - ERR
-    restore_previous_application
-    exit "$status"
+rollback_deployment() {
+    local application_restored=0
+    restore_previous_application || application_restored=$?
+    if [[ $application_restored -ne 0 ]]; then
+        printf '%s\n' "Nginx remains in maintenance mode because application recovery failed." >&2
+        return "$application_restored"
+    fi
+    restore_nginx_files
+    if [[ $NGINX_BACKUP_READY -eq 1 ]]; then
+        nginx -t && systemctl reload nginx
+    fi
+    NGINX_BACKUP_READY=0
 }
 
 backup_replaced_file() {
@@ -113,9 +137,7 @@ restore_nginx_files() {
 rollback_nginx_on_error() {
     local status=$?
     trap - ERR
-    restore_nginx_files
-    nginx -t && systemctl reload nginx || true
-    restore_previous_application
+    rollback_deployment || true
     exit "$status"
 }
 
@@ -157,17 +179,29 @@ finally:
 PY
 }
 
-install_nginx_site() {
+replace_nginx_site() {
     local source=$1
-    prepare_nginx_backup
-    trap rollback_nginx_on_error ERR
-    write_host_proxy_auth
     install -m 0644 "$source" "$NGINX_AVAILABLE"
     rm -f -- "$NGINX_ENABLED"
     ln -s "$NGINX_AVAILABLE" "$NGINX_ENABLED"
     nginx -t
     systemctl reload nginx
-    trap - ERR
+}
+
+enter_maintenance_site() {
+    prepare_nginx_backup
+    trap rollback_nginx_on_error ERR
+    if [[ -f "$CERTIFICATE" ]]; then
+        replace_nginx_site "$NGINX_MAINTENANCE_SOURCE"
+    else
+        replace_nginx_site "$NGINX_HTTP_SOURCE"
+    fi
+}
+
+commit_nginx_site() {
+    local source=$1
+    write_host_proxy_auth
+    replace_nginx_site "$source"
 }
 
 validate_data_directories() {
@@ -321,7 +355,7 @@ PY
 [[ $EUID -eq 0 ]] || fail "run as root so ownership and Nginx checks are deterministic"
 [[ "$SCRIPT_DIR" == "$TARGET/deploy" ]] || fail "deploy.sh must run from $TARGET/deploy"
 [[ "$(realpath "$TARGET")" == "$TARGET" ]] || fail "target path must be exactly $TARGET"
-[[ -f "$COMPOSE_FILE" && -f "$NGINX_TLS_SOURCE" && -f "$NGINX_HTTP_SOURCE" && -f "$CERTBOT_HOOK_SOURCE" ]] || fail "deployment assets are incomplete"
+[[ -f "$COMPOSE_FILE" && -f "$NGINX_TLS_SOURCE" && -f "$NGINX_HTTP_SOURCE" && -f "$NGINX_MAINTENANCE_SOURCE" && -f "$CERTBOT_HOOK_SOURCE" ]] || fail "deployment assets are incomplete"
 command -v docker >/dev/null || fail "docker is required"
 docker compose version >/dev/null || fail "Docker Compose v2 is required"
 command -v curl >/dev/null || fail "curl is required"
@@ -402,28 +436,45 @@ if len(decoded_key) != 32:
 PY
 
 CURRENT_APP_CONTAINER="$(compose ps -q app)"
+CURRENT_PROXY_CONTAINER="$(compose ps -q file_proxy)"
 if [[ -n "$CURRENT_APP_CONTAINER" && \
       "$(docker inspect --format '{{.State.Running}}' "$CURRENT_APP_CONTAINER")" == true ]]; then
     HAD_RUNNING_APP=1
+    if [[ -z "$CURRENT_PROXY_CONTAINER" || \
+          "$(docker inspect --format '{{.State.Running}}' "$CURRENT_PROXY_CONTAINER")" != true ]]; then
+        fail "running app has no running file proxy; refusing an unsafe upgrade"
+    fi
+    HAD_RUNNING_PROXY=1
     ROLLBACK_TAG="tai-pan-cloud:rollback-$(date -u +%Y%m%dT%H%M%SZ)"
+    PROXY_ROLLBACK_TAG="tai-pan-file-proxy:rollback-$(date -u +%Y%m%dT%H%M%SZ)"
     docker image tag \
         "$(docker inspect --format '{{.Image}}' "$CURRENT_APP_CONTAINER")" \
         "$ROLLBACK_TAG"
+    docker image tag \
+        "$(docker inspect --format '{{.Image}}' "$CURRENT_PROXY_CONTAINER")" \
+        "$PROXY_ROLLBACK_TAG"
 fi
 
-compose build app
-compose pull file_proxy
+compose build app file_proxy
+
+install -d -m 0700 "$TARGET/rollback"
+install -d -m 0755 /var/www/letsencrypt/.well-known/acme-challenge
+install -d -m 0755 /etc/nginx/snippets
+if [[ -f "$CERTIFICATE" ]]; then
+    install -d -m 0755 /etc/letsencrypt/renewal-hooks/deploy
+    install -m 0755 "$CERTBOT_HOOK_SOURCE" "$CERTBOT_HOOK"
+fi
+
+enter_maintenance_site
 
 APP_SWITCH_ACTIVE=1
-trap rollback_application_on_error ERR
 compose stop app file_proxy backup
 compose --profile bootstrap stop bootstrap
 validate_data_directories
-install -d -m 0700 "$TARGET/rollback"
 generate_runtime_secrets
 PREDEPLOY_SNAPSHOT="$(create_predeploy_snapshot)"
 
-compose up -d app file_proxy backup
+compose up -d app file_proxy
 
 healthy=0
 for _ in $(seq 1 60); do
@@ -435,19 +486,21 @@ for _ in $(seq 1 60); do
 done
 [[ $healthy -eq 1 ]] || fail "application did not become healthy"
 
-install -d -m 0755 /var/www/letsencrypt/.well-known/acme-challenge
-install -d -m 0755 /etc/nginx/snippets
+compose up -d backup
+
 if [[ ! -f "$CERTIFICATE" ]]; then
-    install_nginx_site "$NGINX_HTTP_SOURCE"
+    commit_nginx_site "$NGINX_HTTP_SOURCE"
     APP_SWITCH_ACTIVE=0
+    NGINX_BACKUP_READY=0
+    trap - ERR
     printf '%s\n' "Application is healthy and the HTTP-only ACME site is installed."
     printf '%s\n' "Obtain the TLS certificate as documented, then run this script again."
     exit 0
 fi
 
-install -d -m 0755 /etc/letsencrypt/renewal-hooks/deploy
-install -m 0755 "$CERTBOT_HOOK_SOURCE" "$CERTBOT_HOOK"
-install_nginx_site "$NGINX_TLS_SOURCE"
+commit_nginx_site "$NGINX_TLS_SOURCE"
 APP_SWITCH_ACTIVE=0
+NGINX_BACKUP_READY=0
+trap - ERR
 
 printf '%s\n' "tai-pan-cloud is healthy and its dedicated Nginx TLS site is installed."

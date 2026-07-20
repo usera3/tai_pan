@@ -48,7 +48,10 @@ services:
       retries: 3
 
   file_proxy:
-    image: nginx:1.27-alpine
+    build:
+      context: ./nginx
+      dockerfile: Dockerfile
+    image: tai-pan-file-proxy:latest
     entrypoint:
       - nginx
       - -g
@@ -57,10 +60,6 @@ services:
     ports:
       - "127.0.0.1:18765:8080"
     volumes:
-      - type: bind
-        source: /home/ubuntu/tai-pan-cloud/deploy/nginx/file-proxy.conf
-        target: /etc/nginx/nginx.conf
-        read_only: true
       - type: bind
         source: /home/ubuntu/tai-pan-cloud/runtime-secrets/file-proxy-auth.conf
         target: /etc/nginx/proxy-auth.conf
