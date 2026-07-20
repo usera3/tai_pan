@@ -149,6 +149,7 @@ def test_nginx_site_has_bounded_uploads_internal_files_and_safe_forwarding():
     )
     assert "alias /protected/;" in file_proxy
     assert "include /etc/nginx/proxy-auth.conf;" in file_proxy
+    assert "map_hash_bucket_size 128;" in file_proxy
     assert "proxy_pass http://app:8000;" in file_proxy
     assert 'proxy_set_header X-Tai-Pan-Proxy-Secret "";' in file_proxy
     assert "wd.claudcode.xyz" not in nginx
