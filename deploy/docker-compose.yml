@@ -15,14 +15,15 @@ services:
       - --port=8000
       - --workers=1
       - --proxy-headers
-      - --forwarded-allow-ips=10.203.187.1
+      - --forwarded-allow-ips=10.203.187.3
       - --no-server-header
-    ports:
-      - "127.0.0.1:18765:8000"
     volumes:
       - type: bind
-        source: /home/ubuntu/tai-pan-cloud/data
-        target: /data
+        source: /home/ubuntu/tai-pan-cloud/data/database
+        target: /data/database
+      - type: bind
+        source: /home/ubuntu/tai-pan-cloud/data/files
+        target: /data/files
     networks:
       internal:
         ipv4_address: 10.203.187.2
@@ -46,6 +47,55 @@ services:
       start_period: 10s
       retries: 3
 
+  file_proxy:
+    image: nginx:1.27-alpine
+    entrypoint:
+      - nginx
+      - -g
+      - daemon off;
+    user: "10001:10001"
+    ports:
+      - "127.0.0.1:18765:8080"
+    volumes:
+      - type: bind
+        source: /home/ubuntu/tai-pan-cloud/deploy/nginx/file-proxy.conf
+        target: /etc/nginx/nginx.conf
+        read_only: true
+      - type: bind
+        source: /home/ubuntu/tai-pan-cloud/runtime-secrets/file-proxy-auth.conf
+        target: /etc/nginx/proxy-auth.conf
+        read_only: true
+      - type: bind
+        source: /home/ubuntu/tai-pan-cloud/data/files
+        target: /protected
+        read_only: true
+    networks:
+      internal:
+        ipv4_address: 10.203.187.3
+    depends_on:
+      app:
+        condition: service_healthy
+    restart: unless-stopped
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test:
+        - CMD
+        - wget
+        - --quiet
+        - --spider
+        - http://127.0.0.1:8080/health
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
   backup:
     image: tai-pan-cloud:latest
     command:
@@ -54,19 +104,42 @@ services:
       - app.cloud.maintenance
       - daily
       - --database-path
-      - /data/app.db
+      - /database/app.db
       - --backup-dir
-      - /data/backups
+      - /backups/daily
     volumes:
       - type: bind
-        source: /home/ubuntu/tai-pan-cloud/data
-        target: /data
+        source: /home/ubuntu/tai-pan-cloud/data/database
+        target: /database
+      - type: bind
+        source: /home/ubuntu/tai-pan-cloud/data/backups
+        target: /backups
     network_mode: none
     depends_on:
       app:
         condition: service_healthy
     restart: unless-stopped
     init: true
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  bootstrap:
+    image: tai-pan-cloud:latest
+    profiles:
+      - bootstrap
+    volumes:
+      - type: bind
+        source: /home/ubuntu/tai-pan-cloud/data/database
+        target: /database
+      - type: bind
+        source: /home/ubuntu/tai-pan-cloud/data/credentials
+        target: /credentials
+    network_mode: none
     read_only: true
     tmpfs:
       - /tmp:size=16m,mode=1777

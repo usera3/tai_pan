@@ -112,12 +112,13 @@ def make_tenant(cloud_app):
             repository.save_user_settings(user.id, tmp_key=tmp_key, now=NOW)
         session_token = f"session-{username}"
         csrf_token = f"csrf-{username}"
+        session_now = datetime.now(timezone.utc)
         repository.create_session(
             user.id,
             token=session_token,
             csrf_token=csrf_token,
-            expires_at=NOW + timedelta(days=1),
-            now=NOW,
+            expires_at=session_now + timedelta(days=1),
+            now=session_now,
         )
         client = TestClient(cloud_app, base_url=PUBLIC_ORIGIN)
         client.cookies.set(

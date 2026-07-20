@@ -15,3 +15,5 @@ deploy
 data
 *.db
 .env
+.proxy-secret
+runtime-secrets

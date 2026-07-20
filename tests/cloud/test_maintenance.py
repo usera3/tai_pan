@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import stat
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -8,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from app.cloud.db import Database
+from app.cloud import maintenance
 from app.cloud.maintenance import BACKUP_RETENTION, create_backup
 
 
@@ -42,6 +44,7 @@ def test_create_backup_uses_sqlite_snapshot_and_publishes_complete_file(
     assert published.parent == backup_dir
     assert published.name == "app-20260717T030405678901Z-000000.sqlite3"
     assert published.is_file()
+    assert stat.S_IMODE(published.stat().st_mode) == 0o600
     assert _probe_values(published) == ["before-backup"]
     assert list(backup_dir.glob(".*.pending-*")) == []
 
@@ -119,3 +122,31 @@ def test_create_backup_orders_same_timestamp_invocations_by_publication(
     ]
 
     assert sorted(backup_dir.glob("app-*.sqlite3")) == published[1:]
+
+
+def test_daily_backup_keeps_one_restore_point_per_utc_day(tmp_path: Path):
+    database = _seed_database(tmp_path / "app.db")
+    backup_dir = tmp_path / "daily"
+    start = datetime(2026, 7, 1, 12, tzinfo=timezone.utc)
+
+    first = maintenance.create_daily_backup(database, backup_dir, now=start)
+    repeated = maintenance.create_daily_backup(
+        database,
+        backup_dir,
+        now=start + timedelta(hours=11),
+    )
+    created = [first]
+    for offset in range(1, BACKUP_RETENTION + 2):
+        created.append(
+            maintenance.create_daily_backup(
+                database,
+                backup_dir,
+                now=start + timedelta(days=offset),
+            )
+        )
+
+    remaining = sorted(backup_dir.glob("app-daily-*.sqlite3"))
+    assert repeated == first
+    assert remaining == created[-BACKUP_RETENTION:]
+    assert len({path.name[10:18] for path in remaining}) == BACKUP_RETENTION
+    assert all(stat.S_IMODE(path.stat().st_mode) == 0o600 for path in remaining)

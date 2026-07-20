@@ -5,7 +5,7 @@ import fcntl
 import os
 import time
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterator
 from uuid import uuid4
@@ -68,6 +68,22 @@ def _prune_old_backups(backup_dir: Path) -> None:
         obsolete.unlink()
 
 
+def _publish_backup(database: Database, staging: Path, destination: Path) -> None:
+    try:
+        database.backup(staging)
+        descriptor = os.open(staging, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+        try:
+            os.fchmod(descriptor, 0o600)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.replace(staging, destination)
+        _fsync_directory(destination.parent)
+    except BaseException:
+        staging.unlink(missing_ok=True)
+        raise
+
+
 def create_backup(
     database: Database,
     backup_dir: Path | str,
@@ -82,14 +98,7 @@ def create_backup(
         destination = _unused_destination(destination_dir, timestamp)
         staging = destination_dir / f".{destination.name}.pending-{uuid4().hex}"
         try:
-            database.backup(staging)
-            descriptor = os.open(staging, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
-            try:
-                os.fsync(descriptor)
-            finally:
-                os.close(descriptor)
-            os.replace(staging, destination)
-            _fsync_directory(destination_dir)
+            _publish_backup(database, staging, destination)
             _prune_old_backups(destination_dir)
             _fsync_directory(destination_dir)
         except BaseException:
@@ -98,11 +107,44 @@ def create_backup(
         return destination
 
 
+def create_daily_backup(
+    database: Database,
+    backup_dir: Path | str,
+    *,
+    now: datetime | None = None,
+) -> Path:
+    """Publish at most one snapshot for each UTC day and retain seven days."""
+    destination_dir = Path(backup_dir)
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        raise ValueError("backup timestamp must include a timezone")
+    day = current.astimezone(timezone.utc).strftime("%Y%m%d")
+    destination = destination_dir / f"app-daily-{day}.sqlite3"
+
+    with _backup_lock(destination_dir):
+        if destination.is_file():
+            return destination
+        staging = destination_dir / f".{destination.name}.pending-{uuid4().hex}"
+        _publish_backup(database, staging, destination)
+        backups = sorted(destination_dir.glob("app-daily-*.sqlite3"))
+        for obsolete in backups[:-BACKUP_RETENTION]:
+            obsolete.unlink()
+        _fsync_directory(destination_dir)
+        return destination
+
+
 def run_daily_backups(database: Database, backup_dir: Path | str) -> None:
     while True:
-        published = create_backup(database, backup_dir)
+        published = create_daily_backup(database, backup_dir)
         print(f"Published SQLite backup: {published.name}", flush=True)
-        time.sleep(DAILY_INTERVAL_SECONDS)
+        now = datetime.now(timezone.utc)
+        next_day = (now + timedelta(days=1)).replace(
+            hour=0,
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+        time.sleep(max(1, (next_day - now).total_seconds()))
 
 
 def _parser() -> argparse.ArgumentParser:

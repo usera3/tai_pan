@@ -5,10 +5,15 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).parents[2]
+GITIGNORE = ROOT / ".gitignore"
+DOCKERIGNORE = ROOT / ".dockerignore"
 DOCKERFILE = ROOT / "Dockerfile"
 COMPOSE = ROOT / "deploy" / "docker-compose.yml"
 ENV_EXAMPLE = ROOT / "deploy" / "env.example"
 NGINX = ROOT / "deploy" / "nginx" / "cloud.claudcode.xyz.conf"
+FILE_PROXY_NGINX = ROOT / "deploy" / "nginx" / "file-proxy.conf"
+HTTP_NGINX = ROOT / "deploy" / "nginx" / "cloud.claudcode.xyz.http.conf"
+CERTBOT_HOOK = ROOT / "deploy" / "certbot-nginx-reload.sh"
 DEPLOY = ROOT / "deploy" / "deploy.sh"
 DOCS = ROOT / "docs" / "cloud-deployment.md"
 
@@ -25,11 +30,15 @@ def test_container_is_nonroot_single_worker_and_health_checked():
     assert "HEALTHCHECK" in dockerfile
     assert "--workers=1" in dockerfile or "--workers 1" in dockerfile
     assert "healthcheck:" in compose
-    assert "127.0.0.1:18765:8000" in compose
+    assert "127.0.0.1:18765:8080" in compose
+    assert "127.0.0.1:18765:8000" not in compose
     assert "0.0.0.0:18765" not in compose
     assert "type: bind" in compose
-    assert "source: /home/ubuntu/tai-pan-cloud/data" in compose
-    assert "target: /data" in compose
+    assert "source: /home/ubuntu/tai-pan-cloud/data/database" in compose
+    assert "source: /home/ubuntu/tai-pan-cloud/data/files" in compose
+    assert "source: /home/ubuntu/tai-pan-cloud/data/backups" in compose
+    assert "source: /home/ubuntu/tai-pan-cloud/data/credentials" in compose
+    assert "source: /home/ubuntu/tai-pan-cloud/data\n" not in compose
 
 
 def test_compose_is_an_explicit_isolated_project_with_fixed_proxy_peer():
@@ -39,7 +48,7 @@ def test_compose_is_an_explicit_isolated_project_with_fixed_proxy_peer():
     assert re.search(r"^\s+name:\s*tai-pan-cloud-internal\s*$", compose, re.MULTILINE)
     assert "10.203.187.0/28" in compose
     assert "10.203.187.1" in compose
-    assert "--forwarded-allow-ips=10.203.187.1" in compose
+    assert "--forwarded-allow-ips=10.203.187.3" in compose
     assert "--forwarded-allow-ips=*" not in compose
     assert "external: true" not in compose
     assert "network_mode: host" not in compose
@@ -47,6 +56,9 @@ def test_compose_is_an_explicit_isolated_project_with_fixed_proxy_peer():
     assert not re.search(r"postgres(?:ql)?", compose, re.IGNORECASE)
     assert re.search(r"^\s{2}app:\s*$", compose, re.MULTILINE)
     assert re.search(r"^\s{2}backup:\s*$", compose, re.MULTILINE)
+    assert re.search(r"^\s{2}file_proxy:\s*$", compose, re.MULTILINE)
+    assert re.search(r"^\s{2}bootstrap:\s*$", compose, re.MULTILINE)
+    assert "ipv4_address: 10.203.187.3" in compose
     assert "app.cloud.maintenance" in compose
     assert "daily" in compose
 
@@ -63,22 +75,37 @@ def test_deployment_assets_contain_no_embedded_secrets():
 
     assert env_lines["APP_MODE"] == "cloud"
     assert env_lines["PUBLIC_ORIGIN"] == "https://cloud.claudcode.xyz"
-    assert env_lines["DATABASE_PATH"] == "/data/app.db"
+    assert env_lines["DATABASE_PATH"] == "/data/database/app.db"
     assert env_lines["STORAGE_PATH"] == "/data/files"
     assert env_lines["SESSION_SECRET"] == "<generated-on-server>"
     assert env_lines["KEY_ENCRYPTION_KEY"] == "<generated-on-server>"
 
     tracked_assets = "\n".join(
         _read(path)
-        for path in (DOCKERFILE, COMPOSE, ENV_EXAMPLE, NGINX, DOCS)
+        for path in (
+            DOCKERFILE,
+            COMPOSE,
+            ENV_EXAMPLE,
+            NGINX,
+            FILE_PROXY_NGINX,
+            HTTP_NGINX,
+            CERTBOT_HOOK,
+            DOCS,
+        )
     )
     assert "sk-proj-" not in tracked_assets
     assert not re.search(r"KEY_ENCRYPTION_KEY=[A-Za-z0-9_-]{40,}={0,2}", tracked_assets)
     assert not re.search(r"SESSION_SECRET=[A-Za-z0-9_-]{32,}", tracked_assets)
 
+    for ignore_file in (GITIGNORE, DOCKERIGNORE):
+        ignored = _read(ignore_file).splitlines()
+        assert ".proxy-secret" in ignored
+        assert "runtime-secrets/" in ignored or "runtime-secrets" in ignored
+
 
 def test_nginx_site_has_bounded_uploads_internal_files_and_safe_forwarding():
     nginx = _read(NGINX)
+    file_proxy = _read(FILE_PROXY_NGINX)
 
     assert "server_name cloud.claudcode.xyz;" in nginx
     assert "client_max_body_size 210m;" in nginx
@@ -86,8 +113,17 @@ def test_nginx_site_has_bounded_uploads_internal_files_and_safe_forwarding():
     assert "proxy_set_header X-Forwarded-For $remote_addr;" in nginx
     assert "proxy_set_header X-Real-IP $remote_addr;" in nginx
     assert "$proxy_add_x_forwarded_for" not in nginx
-    assert re.search(r"location\s+/_protected_files/\s*\{[^}]*\binternal;", nginx, re.DOTALL)
-    assert "alias /home/ubuntu/tai-pan-cloud/data/files/;" in nginx
+    assert "alias /home/ubuntu/tai-pan-cloud/data/files/;" not in nginx
+    assert "include /etc/nginx/snippets/tai-pan-cloud-upstream-auth.conf;" in nginx
+    assert re.search(
+        r"location\s+/_protected_files/\s*\{[^}]*\binternal;",
+        file_proxy,
+        re.DOTALL,
+    )
+    assert "alias /protected/;" in file_proxy
+    assert "include /etc/nginx/proxy-auth.conf;" in file_proxy
+    assert "proxy_pass http://app:8000;" in file_proxy
+    assert 'proxy_set_header X-Tai-Pan-Proxy-Secret "";' in file_proxy
     assert "wd.claudcode.xyz" not in nginx
     assert "api.claudcode.xyz" not in nginx
 
@@ -105,14 +141,47 @@ def test_deploy_script_is_target_locked_secret_safe_and_project_scoped():
     assert "os.O_EXCL" in script
     assert "O_NOFOLLOW" in script
     assert "backup_replaced_file" in script
-    assert "docker compose --project-name tai-pan-cloud" in script
+    assert "validate_data_directories" in script
+    assert "O_DIRECTORY" in script
+    assert "compose stop app file_proxy backup" in script
+    assert "reject_legacy_layout" in script
+    main_stop = script.rindex("\ncompose stop app file_proxy backup\n")
+    assert script.index("\nreject_legacy_layout\n") < main_stop
+    assert script.index("compose build app") < main_stop
+    assert main_stop < script.index("\nvalidate_data_directories\n")
+    assert "pre-deploy" in script
+    assert "PRAGMA integrity_check" in script
+    assert ".pending-" in script
+    assert "os.replace" in script
+    assert "PREDEPLOY_RETENTION" in script
+    assert "rollback_application_on_error" in script
+    assert "--force-recreate app file_proxy backup" in script
+    assert "tai-pan-cloud-upstream-auth.conf" in script
+    assert "certbot-nginx-reload" in script
+    assert 'PROJECT=tai-pan-cloud' in script
+    assert 'docker compose --project-name "$PROJECT"' in script
     assert "curl --fail --silent --show-error http://127.0.0.1:18765/health" in script
-    assert script.index("127.0.0.1:18765/health") < script.index("nginx -t")
+    assert script.index("127.0.0.1:18765/health") < script.index(
+        'install_nginx_site "$NGINX_HTTP_SOURCE"'
+    )
     assert "docker prune" not in script
     assert "docker system" not in script
     assert "docker stop" not in script
     assert "systemctl restart docker" not in script
     assert "mktemp" not in script
+
+
+def test_tls_assets_are_staged_and_renewed_with_validation():
+    deploy = _read(DEPLOY)
+    http_nginx = _read(HTTP_NGINX)
+    hook = _read(CERTBOT_HOOK)
+
+    assert "listen 80;" in http_nginx
+    assert "ssl_certificate" not in http_nginx
+    assert "restore_nginx_files" in deploy
+    assert "trap" in deploy
+    assert "nginx -t" in hook
+    assert "systemctl reload nginx" in hook
 
 
 def test_operations_guide_covers_required_production_procedures():
@@ -140,3 +209,7 @@ def test_operations_guide_covers_required_production_procedures():
     )
     for text in required_text:
         assert text in docs
+    assert "certbot renew --dry-run --run-deploy-hooks" in docs
+    assert "data/backups/manual/app-" in docs
+    assert ".proxy-secret" in docs
+    assert "runtime-secrets" in docs

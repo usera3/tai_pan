@@ -8,11 +8,18 @@ Docker network, Nginx site, database, or MQTT service.
 
 - Compose project: `tai-pan-cloud`.
 - Host listener: `127.0.0.1:18765` only.
-- Persistent bind: `/home/ubuntu/tai-pan-cloud/data` mounted at `/data`.
-- SQLite: `/data/app.db`; permanent files: `/data/files`; backups:
-  `/data/backups`.
+- Persistent data is split into fixed database, permanent-file, backup, and
+  bootstrap-credential bind mounts. No container can write the whole `data`
+  parent.
+- SQLite: `/data/database/app.db`; permanent files: `/data/files`; daily
+  backups: `/backups/daily` in the backup container.
 - Docker network: `10.203.187.0/28`, gateway `10.203.187.1`.
-- Uvicorn runs one worker and trusts proxy headers only from that gateway.
+- A non-root Nginx file-proxy sidecar at `10.203.187.3` owns the localhost
+  listener and reads the permanent-file mount read-only. Uvicorn has no host
+  port and trusts proxy headers only from this fixed sidecar address.
+- The host and sidecar authenticate their private proxy hop with a random
+  server-generated header. The header and application secrets are never
+  committed or printed.
 - Nginx overwrites `X-Forwarded-For` with `$remote_addr` and also sets
   `X-Real-IP`. It never appends an inbound forwarding chain.
 - There is no PostgreSQL or other database service in this deployment.
@@ -43,8 +50,9 @@ the existing container, Nginx, and MQTT status for the post-deploy comparison.
 ## Release and server-generated secrets
 
 Place the reviewed release directly at `/home/ubuntu/tai-pan-cloud`, owned by
-root and not writable by other users. Do not include `.env`, `data`, or a
-credential file in the release archive. Then run:
+root and not writable by other users. Do not include `.env`, `.proxy-secret`,
+`runtime-secrets`, `data`, or a credential file in the release archive. Then
+run:
 
 ```bash
 cd /home/ubuntu/tai-pan-cloud
@@ -52,10 +60,19 @@ sudo ./deploy/deploy.sh
 curl --fail http://127.0.0.1:18765/health
 ```
 
-`deploy.sh` refuses another target, creates the data directories with the
-container UID, and creates `/home/ubuntu/tai-pan-cloud/.env` directly with
-mode `0600`. `SESSION_SECRET` and `KEY_ENCRYPTION_KEY` are generated on the
-server and are never printed. Existing secret files are validated, not
+`deploy.sh` refuses another target and the unsupported pre-sidecar Task 8 data
+layout before stopping anything. It builds the new images while the existing
+application remains online. During the switch it stops only this Compose
+project and checks each fixed data directory without following symlinks. The
+root-owned `data` parent is not writable by containers. Before starting a new
+image, an existing database is copied atomically with the SQLite Backup API to
+`data/pre-deploy`, must pass `PRAGMA integrity_check`, and is retained for five
+deployments. A failed switch restores that snapshot, retags the prior image,
+and recreates the prior project services.
+
+The script creates `.env` and `.proxy-secret` directly with mode `0600`.
+`SESSION_SECRET`, `KEY_ENCRYPTION_KEY`, and the proxy token are generated on
+the server and are never printed. Existing secret files are validated, not
 replaced. The script builds and operates only this project:
 
 ```bash
@@ -66,36 +83,28 @@ The tracked `deploy/env.example` contains placeholders, not usable secrets.
 
 ## TLS staging
 
-The tracked Nginx site references certificate files, so do not install it
-before the certificate exists. On a first deployment, `deploy.sh` validates
-the local application and leaves Nginx unchanged. Create a dedicated ACME
-webroot and an HTTP-only staging site after backing up any same-name file:
+On a first deployment, `deploy.sh` installs the tracked HTTP-only ACME site.
+It rejects unsafe Nginx target types, backs up both `sites-available` and
+`sites-enabled`, and restores the prior files automatically if `nginx -t` or
+reload fails. After the first deployment reports that the ACME site is ready,
+obtain the certificate:
 
 ```bash
-sudo install -d -m 0755 /var/www/letsencrypt/.well-known/acme-challenge
-sudo test ! -e /etc/nginx/sites-available/cloud.claudcode.xyz || \
-  sudo cp -a /etc/nginx/sites-available/cloud.claudcode.xyz \
-    /home/ubuntu/tai-pan-cloud/rollback/cloud.claudcode.xyz.pre-tls
-sudo sh -c 'printf "%s\n" \
-"server {" \
-"    listen 80;" \
-"    listen [::]:80;" \
-"    server_name cloud.claudcode.xyz;" \
-"    location /.well-known/acme-challenge/ { root /var/www/letsencrypt; }" \
-"    location / { return 503; }" \
-"}" > /etc/nginx/sites-available/cloud.claudcode.xyz'
-sudo ln -sfn /etc/nginx/sites-available/cloud.claudcode.xyz \
-  /etc/nginx/sites-enabled/cloud.claudcode.xyz
-sudo nginx -t
-sudo systemctl reload nginx
 sudo certbot certonly --webroot -w /var/www/letsencrypt \
   -d cloud.claudcode.xyz
 ```
 
 After Certbot succeeds, run `sudo ./deploy/deploy.sh` again. It checks local
-health before backing up and replacing only this site's Nginx files, runs
-`nginx -t`, and reloads Nginx. A failed certificate request must leave the
-HTTP-only staging site in place; it must never install a broken TLS site.
+health before transactionally installing the TLS site. It also installs a
+root-controlled Certbot deploy hook that runs `nginx -t` before reload. Verify
+the renewal path after TLS is live:
+
+```bash
+sudo certbot renew --dry-run --run-deploy-hooks
+```
+
+A failed certificate request leaves the HTTP-only staging site in place; it
+must never install a broken TLS site.
 
 ## Bootstrap administrator
 
@@ -105,13 +114,14 @@ password to a container-owned `0600` credential file and prints no credential:
 ```bash
 cd /home/ubuntu/tai-pan-cloud
 sudo CLOUD_ENV_FILE=/home/ubuntu/tai-pan-cloud/.env \
-  docker compose --project-name tai-pan-cloud --file deploy/docker-compose.yml \
-  exec -T app python -m app.cloud.admin_cli \
-  --database-path /data/app.db \
+  docker compose --profile bootstrap --project-name tai-pan-cloud \
+  --file deploy/docker-compose.yml run --rm --no-deps bootstrap \
+  python -m app.cloud.admin_cli \
+  --database-path /database/app.db \
   --username admin \
-  --credentials-file /data/secrets/initial-admin.json
+  --credentials-file /credentials/initial-admin.json
 sudo stat -c '%a %u:%g %n' \
-  /home/ubuntu/tai-pan-cloud/data/secrets/initial-admin.json
+  /home/ubuntu/tai-pan-cloud/data/credentials/initial-admin.json
 ```
 
 The mode must be `0600` and the owner must be UID/GID `10001`. Read
@@ -121,10 +131,12 @@ is confirmed. Never paste its contents into a shell history, ticket, or chat.
 
 ## Backups
 
-The `backup` service takes a consistent SQLite Backup API snapshot immediately
-on startup and every 24 hours. Publication is atomic, concurrent runs are
-serialized, and exactly the latest seven `app-*.sqlite3` files are retained.
-The environment file and encryption key are not copied into a backup.
+The `backup` service takes a consistent SQLite Backup API snapshot for the
+current UTC date, then wakes at the next UTC midnight. Restarts on the same day
+reuse that day's snapshot, so retention provides seven distinct daily restore
+points. Publication is atomic, concurrent runs are serialized, and every
+published snapshot is mode `0600`. The environment file and encryption key
+are not copied into a backup.
 
 Run a one-shot manual backup with the same implementation:
 
@@ -133,8 +145,8 @@ cd /home/ubuntu/tai-pan-cloud
 sudo CLOUD_ENV_FILE=/home/ubuntu/tai-pan-cloud/.env \
   docker compose --project-name tai-pan-cloud --file deploy/docker-compose.yml \
   run --rm --no-deps backup python -m app.cloud.maintenance backup \
-  --database-path /data/app.db --backup-dir /data/backups
-sudo ls -l /home/ubuntu/tai-pan-cloud/data/backups/app-*.sqlite3
+  --database-path /database/app.db --backup-dir /backups/manual
+sudo ls -l /home/ubuntu/tai-pan-cloud/data/backups/manual/app-*.sqlite3
 ```
 
 Permanent storage means files survive application/container restart. It does
@@ -151,18 +163,18 @@ start only the dedicated Compose services:
 
 ```bash
 cd /home/ubuntu/tai-pan-cloud
-export SNAPSHOT=/home/ubuntu/tai-pan-cloud/data/backups/app-YYYYMMDDTHHMMSSffffffZ.sqlite3
+export SNAPSHOT=/home/ubuntu/tai-pan-cloud/data/backups/daily/app-daily-YYYYMMDD.sqlite3
 sudo CLOUD_ENV_FILE=/home/ubuntu/tai-pan-cloud/.env \
   docker compose --project-name tai-pan-cloud --file deploy/docker-compose.yml \
-  stop app backup
+  stop app file_proxy backup
 sudo python3 -c 'import sqlite3, sys; c=sqlite3.connect(sys.argv[1]); assert c.execute("PRAGMA integrity_check").fetchone()[0] == "ok"; c.close()' "$SNAPSHOT"
-sudo cp -a data/app.db "data/app.db.before-restore-$(date -u +%Y%m%dT%H%M%SZ)"
-sudo install -m 0640 -o 10001 -g 10001 "$SNAPSHOT" data/app.db.restore
-sudo mv -f data/app.db.restore data/app.db
-sudo rm -f data/app.db-wal data/app.db-shm
+sudo cp -a data/database/app.db "data/pre-deploy/app.db.before-restore-$(date -u +%Y%m%dT%H%M%SZ)"
+sudo install -m 0600 -o 10001 -g 10001 "$SNAPSHOT" data/database/app.db.restore
+sudo mv -f data/database/app.db.restore data/database/app.db
+sudo rm -f data/database/app.db-wal data/database/app.db-shm
 sudo CLOUD_ENV_FILE=/home/ubuntu/tai-pan-cloud/.env \
   docker compose --project-name tai-pan-cloud --file deploy/docker-compose.yml \
-  up -d app backup
+  up -d app file_proxy backup
 curl --fail http://127.0.0.1:18765/health
 ```
 
@@ -182,10 +194,10 @@ database snapshot if schema compatibility requires it, then start and test:
 
 ```bash
 sudo CLOUD_ENV_FILE=/home/ubuntu/tai-pan-cloud/.env \
-  docker compose --project-name tai-pan-cloud --file deploy/docker-compose.yml stop app backup
+  docker compose --project-name tai-pan-cloud --file deploy/docker-compose.yml stop app file_proxy backup
 sudo docker image tag tai-pan-cloud:rollback-YYYYMMDDTHHMMSSZ tai-pan-cloud:latest
 sudo CLOUD_ENV_FILE=/home/ubuntu/tai-pan-cloud/.env \
-  docker compose --project-name tai-pan-cloud --file deploy/docker-compose.yml up -d app backup
+  docker compose --project-name tai-pan-cloud --file deploy/docker-compose.yml up -d app file_proxy backup
 curl --fail http://127.0.0.1:18765/health
 ```
 
@@ -216,10 +228,12 @@ sudo nginx -T | sed -n '/server_name cloud.claudcode.xyz/,/^}/p'
 ```
 
 The output must be `10.203.187.0/28 10.203.187.1`; Compose must pass
-`--forwarded-allow-ips=10.203.187.1`, never `*`. Nginx must set
+`--forwarded-allow-ips=10.203.187.3`, never `*`. Host Nginx must set
 `X-Forwarded-For $remote_addr` and `X-Real-IP $remote_addr`. From a second
 client IP, make failed login attempts and confirm the rate-limit/audit source
-is the actual client, not an injected header or the Docker gateway.
+is the actual client, not an injected header or the Docker gateway. A direct
+localhost request to a non-health route without the private proxy header must
+return `403`.
 
 ## Smoke tests and isolation ledger
 
