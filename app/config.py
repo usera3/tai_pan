@@ -14,6 +14,13 @@ DOMAIN_PATTERN = re.compile(
 )
 
 
+def validate_domain(value: str) -> str:
+    domain = value.strip().lower().rstrip(".")
+    if not DOMAIN_PATTERN.fullmatch(domain):
+        raise ValueError("custom domain must be a hostname without a URL scheme or path")
+    return domain
+
+
 @dataclass(frozen=True)
 class AppSettings:
     api_key: str = ""
@@ -30,7 +37,7 @@ class SettingsStore:
         payload = json.loads(self.path.read_text(encoding="utf-8"))
         return AppSettings(
             api_key=str(payload.get("api_key", "")),
-            custom_domain=self._validate_domain(
+            custom_domain=validate_domain(
                 str(payload.get("custom_domain", DEFAULT_CUSTOM_DOMAIN))
             ),
         )
@@ -40,7 +47,7 @@ class SettingsStore:
         normalized_key = api_key.strip() or current.api_key
         settings = AppSettings(
             api_key=normalized_key,
-            custom_domain=self._validate_domain(custom_domain),
+            custom_domain=validate_domain(custom_domain),
         )
         self._save(settings)
         return settings
@@ -57,13 +64,6 @@ class SettingsStore:
             "key_configured": bool(settings.api_key),
             "custom_domain": settings.custom_domain,
         }
-
-    @staticmethod
-    def _validate_domain(value: str) -> str:
-        domain = value.strip().lower().rstrip(".")
-        if not DOMAIN_PATTERN.fullmatch(domain):
-            raise ValueError("custom domain must be a hostname without a URL scheme or path")
-        return domain
 
     def _save(self, settings: AppSettings) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)

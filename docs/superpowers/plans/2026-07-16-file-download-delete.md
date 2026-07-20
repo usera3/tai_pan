@@ -6,6 +6,8 @@
 
 **Architecture:** Extend `TmpLinkClient` with a 24-hour download-link helper and a composed delete operation that creates a direct link to obtain a DKEY before deleting the link and source file. Expose two local FastAPI routes, then add icon actions and an explicit confirmation dialog to the static SPA.
 
+**Download registry addendum:** Persist automatically generated download links in `.local/download_links.json`. Reuse an entry with at least one hour remaining, filter all registered DKEY values from the direct-link list, and never register user-created links.
+
 **Tech Stack:** Python 3.10, FastAPI, HTTPX, vanilla JavaScript, Lucide, pytest, Playwright.
 
 ## Global Constraints
@@ -117,11 +119,11 @@ Run: `git add app/main.py tests/test_routes.py && git commit -m "feat: expose fi
 
 **Interfaces:**
 - Consumes: the two routes from Task 2 plus existing `linkUrl`, `loadFiles`, `loadLinks`, and `refreshDashboard`.
-- Produces: download icon action, delete icon action, and `#file-delete-dialog` confirmation workflow.
+- Produces: background iframe download action, delete icon action, and `#file-delete-dialog` confirmation workflow.
 
 - [ ] **Step 1: Write failing frontend and Playwright tests**
 
-Assert source contains both encoded file routes, the delete dialog, filename warning, and popup handling. In Playwright, return a link from the POST route and verify popup navigation; open delete for a named file, verify the warning, submit, and assert the DELETE route was called.
+Assert source contains both encoded file routes, the delete dialog, filename warning, and hidden iframe handling. In Playwright, return an attachment from the direct URL, verify a browser download event while the management page URL remains unchanged; open delete for a named file, verify the warning, submit, and assert the DELETE route was called.
 
 - [ ] **Step 2: Run tests and verify RED**
 
@@ -131,19 +133,20 @@ Expected: failures because controls and dialog do not exist.
 
 - [ ] **Step 3: Implement UI**
 
-Add pending-file state, append `download` and danger `trash-2` icon buttons in `renderFiles`, and implement popup-first download:
+Add pending-file state, append `download` and danger `trash-2` icon buttons in `renderFiles`, and implement background download:
 
 ```javascript
 async function downloadFile(file) {
-  const popup = window.open("about:blank", "_blank");
   try {
     const result = await api(`/api/files/${encodeURIComponent(file.ukey)}/download`, { method: "POST" });
     const url = linkUrl(result && (result.link || result.url || result));
     if (!url) throw new Error("钛盘未返回下载链接");
-    if (popup) popup.location.replace(url);
-    else window.location.assign(url);
+    const frame = document.createElement("iframe");
+    frame.className = "download-frame";
+    frame.hidden = true;
+    frame.src = url;
+    document.body.append(frame);
   } catch (error) {
-    if (popup) popup.close();
     toast(error.message);
   }
 }

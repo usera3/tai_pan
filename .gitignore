@@ -1,6 +1,12 @@
 .worktrees/
 .venv/
 .local/
+.env
+.proxy-secret
+runtime-secrets/
+deploy/.env
+data/
+rollback/
 __pycache__/
 *.py[cod]
 .pytest_cache/

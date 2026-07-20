@@ -1,0 +1,157 @@
+name: tai-pan-cloud
+
+services:
+  app:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: tai-pan-cloud:latest
+    env_file:
+      - ${CLOUD_ENV_FILE:-./env.example}
+    command:
+      - uvicorn
+      - app.main:app
+      - --host=0.0.0.0
+      - --port=8000
+      - --workers=1
+      - --proxy-headers
+      - --forwarded-allow-ips=10.203.187.3
+      - --no-server-header
+    volumes:
+      - type: bind
+        source: /home/ubuntu/tai-pan-cloud/data/database
+        target: /data/database
+      - type: bind
+        source: /home/ubuntu/tai-pan-cloud/data/files
+        target: /data/files
+    networks:
+      internal:
+        ipv4_address: 10.203.187.2
+    restart: unless-stopped
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).read()
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+  file_proxy:
+    build:
+      context: ./nginx
+      dockerfile: Dockerfile
+    image: tai-pan-file-proxy:latest
+    entrypoint:
+      - nginx
+      - -g
+      - daemon off;
+    user: "10001:10001"
+    ports:
+      - "127.0.0.1:18765:8080"
+    volumes:
+      - type: bind
+        source: /home/ubuntu/tai-pan-cloud/runtime-secrets/file-proxy-auth.conf
+        target: /etc/nginx/proxy-auth.conf
+        read_only: true
+      - type: bind
+        source: /home/ubuntu/tai-pan-cloud/data/files
+        target: /protected
+        read_only: true
+    networks:
+      internal:
+        ipv4_address: 10.203.187.3
+    depends_on:
+      app:
+        condition: service_healthy
+    restart: unless-stopped
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test:
+        - CMD
+        - wget
+        - --quiet
+        - --spider
+        - http://127.0.0.1:8080/health
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+  backup:
+    image: tai-pan-cloud:latest
+    command:
+      - python
+      - -m
+      - app.cloud.maintenance
+      - daily
+      - --database-path
+      - /database/app.db
+      - --backup-dir
+      - /backups/daily
+    volumes:
+      - type: bind
+        source: /home/ubuntu/tai-pan-cloud/data/database
+        target: /database
+      - type: bind
+        source: /home/ubuntu/tai-pan-cloud/data/backups
+        target: /backups
+    network_mode: none
+    depends_on:
+      app:
+        condition: service_healthy
+    restart: unless-stopped
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  bootstrap:
+    image: tai-pan-cloud:latest
+    profiles:
+      - bootstrap
+    volumes:
+      - type: bind
+        source: /home/ubuntu/tai-pan-cloud/data/database
+        target: /database
+      - type: bind
+        source: /home/ubuntu/tai-pan-cloud/data/credentials
+        target: /credentials
+    network_mode: none
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+networks:
+  internal:
+    name: tai-pan-cloud-internal
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.203.187.0/28
+          gateway: 10.203.187.1

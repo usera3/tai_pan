@@ -284,16 +284,20 @@ function renderFiles() {
 }
 
 async function downloadFile(file) {
-  const popup = window.open("about:blank", "_blank");
   try {
     const result = await api(`/api/files/${encodeURIComponent(file.ukey)}/download`, { method: "POST" });
     const link = typeof result === "string" ? result : result && (result.link || result.url);
     const url = linkUrl(link);
     if (!url) throw new Error("钛盘未返回下载链接");
-    if (popup) popup.location.replace(url);
-    else window.location.assign(url);
+    const frame = document.createElement("iframe");
+    frame.className = "download-frame";
+    frame.hidden = true;
+    frame.title = "后台文件下载";
+    frame.src = url;
+    document.body.append(frame);
+    window.setTimeout(() => frame.remove(), 60 * 60 * 1000);
+    toast("下载已开始");
   } catch (error) {
-    if (popup) popup.close();
     toast(error.message);
   }
 }

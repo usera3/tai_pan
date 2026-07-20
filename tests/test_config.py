@@ -2,6 +2,7 @@ from pathlib import Path
 
 import pytest
 
+import app.config as config_module
 from app.config import SettingsStore
 
 
@@ -43,3 +44,10 @@ def test_settings_store_rejects_invalid_domain(tmp_path: Path, domain: str):
 
     with pytest.raises(ValueError, match="custom domain"):
         store.update(api_key="value", custom_domain=domain)
+
+
+def test_domain_validation_is_a_public_shared_function():
+    validator = getattr(config_module, "validate_domain", None)
+
+    assert callable(validator)
+    assert validator(" Files.Example.COM. ") == "files.example.com"

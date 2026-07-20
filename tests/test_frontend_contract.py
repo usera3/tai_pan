@@ -68,7 +68,8 @@ def test_file_actions_include_download_and_confirmed_source_deletion():
 
     assert 'api(`/api/files/${encodeURIComponent(file.ukey)}/download`' in source
     assert 'api(`/api/files/${encodeURIComponent(state.pendingFile.ukey)}`' in source
-    assert 'window.open("about:blank", "_blank")' in source
+    assert 'frame.className = "download-frame"' in source
+    assert 'window.open("about:blank", "_blank")' not in source
     assert 'id="file-delete-dialog"' in html
     assert 'id="file-delete-name"' in html
     assert 'id="file-delete-form"' in html

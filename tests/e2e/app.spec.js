@@ -1,6 +1,14 @@
 const { test, expect } = require("@playwright/test");
 
 async function mockApi(page, calls = []) {
+  await page.route("https://pan.cloudcode.xyz/**", async (route) => {
+    await route.fulfill({
+      status: 200,
+      headers: { "Content-Disposition": 'attachment; filename="report.pdf"' },
+      contentType: "application/pdf",
+      body: "downloaded file",
+    });
+  });
   await page.route("**/api/**", async (route) => {
     const request = route.request();
     const url = new URL(request.url());
@@ -92,17 +100,14 @@ test("creates and deletes a direct link through explicit dialogs", async ({ page
 });
 
 test("downloads and deletes a file through explicit file actions", async ({ page }) => {
-  await page.addInitScript(() => {
-    window.__downloadTarget = "";
-    window.open = () => ({
-      location: { replace: (value) => { window.__downloadTarget = value; } },
-      close: () => {},
-    });
-  });
   await page.goto("/#files");
+  const managerUrl = page.url();
 
+  const downloadPromise = page.waitForEvent("download", { timeout: 5000 });
   await page.getByRole("button", { name: "下载文件" }).click();
-  await expect.poll(() => page.evaluate(() => window.__downloadTarget)).toBe("https://pan.cloudcode.xyz/d/DOWNLOAD-DKEY");
+  const download = await downloadPromise;
+  expect(download.suggestedFilename()).toBe("report.pdf");
+  expect(page.url()).toBe(managerUrl);
 
   await page.getByRole("button", { name: "删除文件" }).click();
   await expect(page.locator("#file-delete-dialog")).toBeVisible();
