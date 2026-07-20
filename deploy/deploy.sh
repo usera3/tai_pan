@@ -52,18 +52,28 @@ reject_legacy_layout() {
 restore_previous_application() {
     [[ $APP_SWITCH_ACTIVE -eq 1 ]] || return 0
     APP_SWITCH_ACTIVE=0
-    compose stop app file_proxy backup || true
+    if ! compose stop app file_proxy backup; then
+        printf '%s\n' "Deployment rollback failed to stop the replacement services." >&2
+        return 1
+    fi
     if [[ $HAD_RUNNING_APP -eq 1 ]]; then
         if [[ -n "$PREDEPLOY_SNAPSHOT" ]]; then
-            rm -f -- "$TARGET/data/database/.app.db.rollback-restore"
-            install -m 0600 -o 10001 -g 10001 "$PREDEPLOY_SNAPSHOT" \
-                "$TARGET/data/database/.app.db.rollback-restore"
-            mv -f -- "$TARGET/data/database/.app.db.rollback-restore" \
-                "$TARGET/data/database/app.db"
-            rm -f -- "$TARGET/data/database/app.db-wal" "$TARGET/data/database/app.db-shm"
+            if ! rm -f -- "$TARGET/data/database/.app.db.rollback-restore" || \
+               ! install -m 0600 -o 10001 -g 10001 "$PREDEPLOY_SNAPSHOT" \
+                    "$TARGET/data/database/.app.db.rollback-restore" || \
+               ! mv -f -- "$TARGET/data/database/.app.db.rollback-restore" \
+                    "$TARGET/data/database/app.db" || \
+               ! rm -f -- "$TARGET/data/database/app.db-wal" \
+                    "$TARGET/data/database/app.db-shm"; then
+                printf '%s\n' "Deployment rollback failed to restore the database." >&2
+                return 1
+            fi
         fi
-        docker image tag "$ROLLBACK_TAG" tai-pan-cloud:latest
-        docker image tag "$PROXY_ROLLBACK_TAG" tai-pan-file-proxy:latest
+        if ! docker image tag "$ROLLBACK_TAG" tai-pan-cloud:latest || \
+           ! docker image tag "$PROXY_ROLLBACK_TAG" tai-pan-file-proxy:latest; then
+            printf '%s\n' "Deployment rollback failed to retag the prior images." >&2
+            return 1
+        fi
         if ! compose up -d --force-recreate app file_proxy backup; then
             printf '%s\n' "Deployment rollback failed to restart the prior services." >&2
             return 1
@@ -81,17 +91,26 @@ restore_previous_application() {
 }
 
 rollback_deployment() {
-    local application_restored=0
-    restore_previous_application || application_restored=$?
-    if [[ $application_restored -ne 0 ]]; then
+    if ! restore_previous_application; then
         printf '%s\n' "Nginx remains in maintenance mode because application recovery failed." >&2
-        return "$application_restored"
+        return 1
     fi
-    restore_nginx_files
     if [[ $NGINX_BACKUP_READY -eq 1 ]]; then
-        nginx -t && systemctl reload nginx
+        if ! restore_nginx_files; then
+            printf '%s\n' "Deployment rollback failed to restore the prior Nginx files." >&2
+            return 1
+        fi
+        if ! nginx -t; then
+            printf '%s\n' "Deployment rollback failed to validate the prior Nginx configuration." >&2
+            return 1
+        fi
+        if ! systemctl reload nginx; then
+            printf '%s\n' "Deployment rollback failed to reload the prior Nginx configuration." >&2
+            return 1
+        fi
+        NGINX_BACKUP_READY=0
     fi
-    NGINX_BACKUP_READY=0
+    return 0
 }
 
 backup_replaced_file() {
@@ -125,13 +144,25 @@ prepare_nginx_backup() {
 
 restore_nginx_files() {
     [[ $NGINX_BACKUP_READY -eq 1 ]] || return 0
-    rm -f -- "$NGINX_AVAILABLE" "$NGINX_ENABLED" "$NGINX_AUTH_SNIPPET"
-    [[ ! -e "$ROLLBACK_DIR/nginx-site-available" && ! -L "$ROLLBACK_DIR/nginx-site-available" ]] || \
-        cp -a -- "$ROLLBACK_DIR/nginx-site-available" "$NGINX_AVAILABLE"
-    [[ ! -e "$ROLLBACK_DIR/nginx-site-enabled" && ! -L "$ROLLBACK_DIR/nginx-site-enabled" ]] || \
-        cp -a -- "$ROLLBACK_DIR/nginx-site-enabled" "$NGINX_ENABLED"
-    [[ ! -e "$ROLLBACK_DIR/nginx-auth-snippet" && ! -L "$ROLLBACK_DIR/nginx-auth-snippet" ]] || \
-        cp -a -- "$ROLLBACK_DIR/nginx-auth-snippet" "$NGINX_AUTH_SNIPPET"
+    if ! rm -f -- "$NGINX_AVAILABLE" "$NGINX_ENABLED" "$NGINX_AUTH_SNIPPET"; then
+        return 1
+    fi
+    if [[ -e "$ROLLBACK_DIR/nginx-site-available" || -L "$ROLLBACK_DIR/nginx-site-available" ]]; then
+        if ! cp -a -- "$ROLLBACK_DIR/nginx-site-available" "$NGINX_AVAILABLE"; then
+            return 1
+        fi
+    fi
+    if [[ -e "$ROLLBACK_DIR/nginx-site-enabled" || -L "$ROLLBACK_DIR/nginx-site-enabled" ]]; then
+        if ! cp -a -- "$ROLLBACK_DIR/nginx-site-enabled" "$NGINX_ENABLED"; then
+            return 1
+        fi
+    fi
+    if [[ -e "$ROLLBACK_DIR/nginx-auth-snippet" || -L "$ROLLBACK_DIR/nginx-auth-snippet" ]]; then
+        if ! cp -a -- "$ROLLBACK_DIR/nginx-auth-snippet" "$NGINX_AUTH_SNIPPET"; then
+            return 1
+        fi
+    fi
+    return 0
 }
 
 rollback_nginx_on_error() {

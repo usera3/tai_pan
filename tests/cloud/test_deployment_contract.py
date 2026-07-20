@@ -175,7 +175,13 @@ def test_deploy_script_is_target_locked_secret_safe_and_project_scoped():
     main_commit = script.rindex('commit_nginx_site "$NGINX_TLS_SOURCE"')
     assert main_health < main_commit
     assert "rollback health check failed" in script
+    assert "rollback failed to stop the replacement services" in script
+    assert "rollback failed to restore the database" in script
+    assert "rollback failed to retag the prior images" in script
+    assert "rollback failed to restore the prior Nginx files" in script
+    assert "rollback failed to validate the prior Nginx configuration" in script
     assert "compose up -d --force-recreate app file_proxy backup || true" not in script
+    assert "compose stop app file_proxy backup || true" not in script
     assert "tai-pan-cloud-upstream-auth.conf" in script
     assert "certbot-nginx-reload" in script
     assert 'PROJECT=tai-pan-cloud' in script

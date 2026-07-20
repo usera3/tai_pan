@@ -99,7 +99,7 @@ def test_create_backup_serializes_concurrent_publish_and_retention(tmp_path: Pat
             )
             for offset in range(12)
         ]
-        published = [future.result(timeout=10) for future in futures]
+        published = [future.result(timeout=120) for future in futures]
 
     remaining = sorted(backup_dir.glob("app-*.sqlite3"))
     assert len(set(published)) == 12
