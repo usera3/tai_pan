@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import re
+import shlex
+import subprocess
 from pathlib import Path
+
+import pytest
 
 
 ROOT = Path(__file__).parents[2]
@@ -22,6 +26,22 @@ DOCS = ROOT / "docs" / "cloud-deployment.md"
 
 def _read(path: Path) -> str:
     return path.read_text(encoding="utf-8")
+
+
+def _run_deploy_functions(body: str, tmp_path: Path) -> subprocess.CompletedProcess[str]:
+    command = f"""
+set -Eeuo pipefail
+export TAI_PAN_DEPLOY_SOURCE_ONLY=1
+source {shlex.quote(str(DEPLOY))}
+TRACE={shlex.quote(str(tmp_path / 'trace'))}
+{body}
+"""
+    return subprocess.run(
+        ["bash", "-c", command],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
 
 
 def test_container_is_nonroot_single_worker_and_health_checked():
@@ -208,6 +228,94 @@ def test_tls_assets_are_staged_and_renewed_with_validation():
     assert "trap" in deploy
     assert "nginx -t" in hook
     assert "systemctl reload nginx" in hook
+
+
+@pytest.mark.parametrize("failure", ["stop", "database", "retag", "startup", "health"])
+def test_application_rollback_fails_closed_under_or_list(
+    failure: str,
+    tmp_path: Path,
+):
+    result = _run_deploy_functions(
+        f"""
+TARGET={shlex.quote(str(tmp_path))}
+mkdir -p "$TARGET/data/database"
+printf snapshot > "$TARGET/snapshot.sqlite3"
+APP_SWITCH_ACTIVE=1
+HAD_RUNNING_APP=1
+PREDEPLOY_SNAPSHOT="$TARGET/snapshot.sqlite3"
+ROLLBACK_TAG=old-app
+PROXY_ROLLBACK_TAG=old-proxy
+ROLLBACK_HEALTH_ATTEMPTS=1
+ROLLBACK_HEALTH_SLEEP_SECONDS=0
+compose() {{
+    if [[ $1 == stop ]]; then [[ {shlex.quote(failure)} != stop ]]; return; fi
+    [[ {shlex.quote(failure)} != startup ]]
+}}
+install() {{
+    [[ {shlex.quote(failure)} != database ]] || return 1
+    command cp "${{@: -2:1}}" "${{@: -1}}"
+}}
+docker() {{ [[ {shlex.quote(failure)} != retag ]]; }}
+curl() {{ [[ {shlex.quote(failure)} != health ]]; }}
+sleep() {{ :; }}
+restore_previous_application || status=$?
+[[ ${{status:-0}} -eq 1 ]]
+""",
+        tmp_path,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("failure", ["app", "nginx_files", "nginx_test", "nginx_reload"])
+def test_deployment_rollback_preserves_maintenance_on_every_failure(
+    failure: str,
+    tmp_path: Path,
+):
+    result = _run_deploy_functions(
+        f"""
+NGINX_BACKUP_READY=1
+restore_previous_application() {{ [[ {shlex.quote(failure)} != app ]]; }}
+persist_maintenance_site() {{ printf maintenance > "$TRACE"; }}
+restore_nginx_files() {{ [[ {shlex.quote(failure)} != nginx_files ]]; }}
+nginx() {{ [[ {shlex.quote(failure)} != nginx_test ]]; }}
+systemctl() {{ [[ {shlex.quote(failure)} != nginx_reload ]]; }}
+rollback_deployment || status=$?
+[[ ${{status:-0}} -eq 1 ]]
+if [[ {shlex.quote(failure)} == app ]]; then
+    [[ $(cat "$TRACE") == maintenance ]]
+fi
+""",
+        tmp_path,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_first_deploy_enters_http_maintenance_without_existing_site_or_certificate(
+    tmp_path: Path,
+):
+    result = _run_deploy_functions(
+        f"""
+NGINX_AVAILABLE={shlex.quote(str(tmp_path / 'available'))}
+NGINX_ENABLED={shlex.quote(str(tmp_path / 'enabled'))}
+NGINX_AUTH_SNIPPET={shlex.quote(str(tmp_path / 'auth'))}
+CERTIFICATE={shlex.quote(str(tmp_path / 'missing-certificate'))}
+ROLLBACK_DIR={shlex.quote(str(tmp_path / 'rollback'))}
+NGINX_HTTP_SOURCE={shlex.quote(str(HTTP_NGINX))}
+nginx() {{ :; }}
+systemctl() {{ :; }}
+enter_maintenance_site
+cmp "$NGINX_AVAILABLE" "$NGINX_HTTP_SOURCE"
+[[ -L "$NGINX_ENABLED" ]]
+[[ $(readlink "$NGINX_ENABLED") == "$NGINX_AVAILABLE" ]]
+[[ $NGINX_BACKUP_READY -eq 1 ]]
+trap - ERR
+""",
+        tmp_path,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_operations_guide_covers_required_production_procedures():

@@ -19,6 +19,8 @@ CERTBOT_HOOK=/etc/letsencrypt/renewal-hooks/deploy/tai-pan-cloud-nginx-reload
 CERTIFICATE=/etc/letsencrypt/live/cloud.claudcode.xyz/fullchain.pem
 ROLLBACK_DIR="$TARGET/rollback/$(date -u +%Y%m%dT%H%M%SZ)"
 PREDEPLOY_RETENTION=5
+ROLLBACK_HEALTH_ATTEMPTS=60
+ROLLBACK_HEALTH_SLEEP_SECONDS=2
 PREDEPLOY_SNAPSHOT=
 ROLLBACK_TAG=
 PROXY_ROLLBACK_TAG=
@@ -78,11 +80,11 @@ restore_previous_application() {
             printf '%s\n' "Deployment rollback failed to restart the prior services." >&2
             return 1
         fi
-        for _ in $(seq 1 60); do
+        for _ in $(seq 1 "$ROLLBACK_HEALTH_ATTEMPTS"); do
             if curl --fail --silent --show-error http://127.0.0.1:18765/health >/dev/null; then
                 return 0
             fi
-            sleep 2
+            sleep "$ROLLBACK_HEALTH_SLEEP_SECONDS"
         done
         printf '%s\n' "Deployment rollback health check failed." >&2
         return 1
@@ -92,19 +94,31 @@ restore_previous_application() {
 
 rollback_deployment() {
     if ! restore_previous_application; then
+        if ! persist_maintenance_site; then
+            printf '%s\n' "Deployment rollback also failed to persist maintenance mode." >&2
+        fi
         printf '%s\n' "Nginx remains in maintenance mode because application recovery failed." >&2
         return 1
     fi
     if [[ $NGINX_BACKUP_READY -eq 1 ]]; then
         if ! restore_nginx_files; then
+            if ! persist_maintenance_site; then
+                printf '%s\n' "Deployment rollback also failed to persist maintenance mode." >&2
+            fi
             printf '%s\n' "Deployment rollback failed to restore the prior Nginx files." >&2
             return 1
         fi
         if ! nginx -t; then
+            if ! persist_maintenance_site; then
+                printf '%s\n' "Deployment rollback also failed to persist maintenance mode." >&2
+            fi
             printf '%s\n' "Deployment rollback failed to validate the prior Nginx configuration." >&2
             return 1
         fi
         if ! systemctl reload nginx; then
+            if ! persist_maintenance_site; then
+                printf '%s\n' "Deployment rollback also failed to persist maintenance mode." >&2
+            fi
             printf '%s\n' "Deployment rollback failed to reload the prior Nginx configuration." >&2
             return 1
         fi
@@ -217,6 +231,21 @@ replace_nginx_site() {
     ln -s "$NGINX_AVAILABLE" "$NGINX_ENABLED"
     nginx -t
     systemctl reload nginx
+}
+
+persist_maintenance_site() {
+    local source=$NGINX_HTTP_SOURCE
+    [[ -f "$CERTIFICATE" ]] && source=$NGINX_MAINTENANCE_SOURCE
+    if ! install -m 0644 "$source" "$NGINX_AVAILABLE"; then
+        return 1
+    fi
+    if ! rm -f -- "$NGINX_ENABLED"; then
+        return 1
+    fi
+    if ! ln -s "$NGINX_AVAILABLE" "$NGINX_ENABLED"; then
+        return 1
+    fi
+    return 0
 }
 
 enter_maintenance_site() {
@@ -383,6 +412,7 @@ finally:
 PY
 }
 
+main() {
 [[ $EUID -eq 0 ]] || fail "run as root so ownership and Nginx checks are deterministic"
 [[ "$SCRIPT_DIR" == "$TARGET/deploy" ]] || fail "deploy.sh must run from $TARGET/deploy"
 [[ "$(realpath "$TARGET")" == "$TARGET" ]] || fail "target path must be exactly $TARGET"
@@ -535,3 +565,8 @@ NGINX_BACKUP_READY=0
 trap - ERR
 
 printf '%s\n' "tai-pan-cloud is healthy and its dedicated Nginx TLS site is installed."
+}
+
+if [[ ${TAI_PAN_DEPLOY_SOURCE_ONLY:-0} != 1 ]]; then
+    main "$@"
+fi
